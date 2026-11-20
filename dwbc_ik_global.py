@@ -149,6 +149,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
         self.switches = 0
         self.last_switch = None    # (time, reason, task/posture costs, max joint change)
         self.switch_log = []       # (time, max joint change rad, blend duration s, reason) for metrics
+        self._fast = False         # set by the warm-up patch below
         self._tgt_prev = None
         self.is_waist = np.zeros(len(self.q_home), dtype=bool)
         for name, i in idx.items():
@@ -273,6 +274,15 @@ class GlobalBodyIKSolver(BodyIKSolver):
                 self.tasks[link_name].set_target(pin.SE3(pose[:3, :3], pose[:3, 3]))
 
         now = self.clock()
+        if self._fast:
+            # IK warm-up (TeleopRetargetingIK runs 50 calls back to back on the first frame after A+X / after a reset):
+            # only the active solution steps - no candidates, upright tracker, mode logic or output motion. With them
+            # the warm-up stalled the teleop loop 2-5 s on the real robot (2026-11-18); the output then moves to the
+            # warmed-up solution over the next frames at the VMAX cap.
+            lock = {"locked": self.q_home[self.is_waist], "returning": self.waist_ref, "free": None}[self.waist_mode] \
+                if self.upright is not None else None
+            self._step(self.configuration, 1, lock)     # 1 step per warm-up call: 50 steps in all
+            return self.q_out.copy()
         self.frame_n += 1
         tp = np.concatenate([self.tasks[f].transform_target_to_world.translation for f in self.hand_frames
                              if self.tasks[f].transform_target_to_world is not None])
@@ -394,3 +404,30 @@ class GlobalBodyIKSolver(BodyIKSolver):
         self.q_out = self.q_out + np.clip(q_want - self.q_out, -step, step)
         self.robot.cache_forward_kinematics(self.q_out)
         return self.q_out.copy()
+
+
+# ---------------------------------------------------------------------------------------------------- warm-up patch
+def _install_fast_warmup():
+    """TeleopRetargetingIK.compute_joint_positions runs the body IK 50x on its warm-up frame; run that warm-up through
+    GlobalBodyIKSolver's cheap path (active solution only)."""
+    import decoupled_wbc.control.teleop.teleop_retargeting_ik as _TRI
+
+    if getattr(_TRI.TeleopRetargetingIK.compute_joint_positions, "_dwbc_fast", False):
+        return
+    _orig = _TRI.TeleopRetargetingIK.compute_joint_positions
+
+    def compute_joint_positions(self, body_data, left_hand_data, right_hand_data):
+        s = getattr(self, "body_ik_solver", None)
+        if self.in_warmup and isinstance(s, GlobalBodyIKSolver):
+            s._fast = True
+            try:
+                return _orig(self, body_data, left_hand_data, right_hand_data)
+            finally:
+                s._fast = False
+        return _orig(self, body_data, left_hand_data, right_hand_data)
+
+    compute_joint_positions._dwbc_fast = True
+    _TRI.TeleopRetargetingIK.compute_joint_positions = compute_joint_positions
+
+
+_install_fast_warmup()
