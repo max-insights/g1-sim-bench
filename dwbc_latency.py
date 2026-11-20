@@ -362,15 +362,125 @@ def resolve_dir(arg):
     return os.path.realpath(d)
 
 
-def summarize(ctrl_rows, track_rows, pico_min, active_only=True):
-    rows = [r for r in ctrl_rows if not active_only or r.get("active") == "1"]
-    hops = {}
+def pico_offset(r):
+    a, b = _f(r.get("wall_ns")), _f(r.get("pico_ts_ns"))
+    return (a - b) / 1e6 if a and b else None
+
+
+def summary(ctrl_rows, track_rows, pico_min, window_s=None, lag_windows=None):
+    """JSON-able summary of control rows (only frames with the arms following) + follow lag. Used by watch / report and
+    by g1_hub (state.link.dwbc, dwbc_lat_detail). lag_windows: list of track-row windows to take the median lag over
+    (whole runs); else the lag of track_rows itself."""
+    rows = [r for r in ctrl_rows if r.get("active") == "1"]
+    vals = {}
     for r in rows:
         for k, v in control_hops(r, pico_min).items():
-            hops.setdefault(k, []).append(v)
-    new = [r for r in rows if r.get("pico_new") == "1"]
-    lag, nj, rms = follow_lag(track_rows)
-    return rows, hops, len(new), lag, nj, rms
+            vals.setdefault(k, []).append(v)
+    if lag_windows is not None:
+        lags = [lg for lg, n, _ in (follow_lag(w) for w in lag_windows) if lg is not None]
+        lag, nj = (pct(lags, 0.5) if lags else None), len(lags)
+        rms = follow_lag(track_rows)[2] if track_rows else None
+    else:
+        lag, nj, rms = follow_lag(track_rows)
+    hops = []
+    for k, label in HOPS:
+        xs = vals.get(k, [])
+        hops.append({"key": k, "label": label, "p50": _r(pct(xs, 0.5)), "p90": _r(pct(xs, 0.9)), "max": _r(pct(xs, 1.0)),
+                     "n": len(xs)})
+    hops.append({"key": "follow", "label": "[11] 机器人跟随滞后 (实测 vs 指令)", "p50": _r(lag), "p90": None, "max": None,
+                 "n": nj})
+    p50 = {h["key"]: h["p50"] for h in hops}
+    e2e = None
+    if p50.get("chain") is not None:
+        e2e = _r((p50.get("pico") or 0) + p50["chain"] + (lag or 0))
+    # the biggest single hop inside the chain (what to look at first)
+    parts = [h for h in hops if h["key"] in ("pico", "streamer", "ik", "other", "ros", "wait", "ctrl", "interp", "follow")
+             and h["p50"] is not None]
+    worst = max(parts, key=lambda h: h["p50"])["key"] if parts else None
+    raw = vals.get("pico_raw", [])
+    new = sum(1 for r in rows if r.get("pico_new") == "1")
+    return {"window_s": window_s, "frames": len(rows), "following": bool(rows), "hops": hops, "e2e_ms": e2e,
+            "chain_ms": p50.get("chain"), "follow_lag_ms": _r(lag), "follow_rms_deg": _r(rms, 2),
+            "follow_n": nj, "pico_clock_ms": _r(pct(raw, 0.5)),
+            "pico_repeat_pct": _r(100.0 * (1 - new / len(rows))) if rows else None, "bottleneck": worst}
+
+
+def _r(v, nd=1):
+    return None if v is None else round(float(v), nd)
+
+
+def read_run(d):
+    ctrl = Tail(os.path.join(d, "lat_control.csv")).read()
+    track = Tail(os.path.join(d, "lat_track.csv")).read()
+    offs = [o for o in (pico_offset(r) for r in ctrl) if o is not None]
+    return ctrl, track, (min(offs) if offs else None)
+
+
+def run_summary(d, series=True, bin_s=1.0):
+    """Whole run: the summary plus (series=True) a 1 s time series of the main hops (p50 per bin, following frames)."""
+    ctrl, track, pico_min = read_run(d)
+    wins = [track[i:i + 250] for i in range(0, len(track), 250)]
+    out = summary(ctrl, track, pico_min, None, lag_windows=wins)
+    out["run"] = os.path.basename(d)
+    t0s = [_f(r.get("t_pick")) for r in ctrl[:1]] + [_f(r.get("t")) for r in track[:1]]
+    t0 = min([t for t in t0s if t is not None], default=None)
+    out["start_mono"] = t0
+    out["duration_s"] = _r(max([_f(r.get("t")) or 0 for r in track[-1:]] + [_f(r.get("t_pick")) or 0 for r in ctrl[-1:]])
+                           - t0) if t0 is not None else None
+    if series and t0 is not None:
+        keys = ("e2e", "chain", "ik", "period", "interp", "pico", "follow")
+        bins = {}
+        for r in ctrl:
+            if r.get("active") != "1":
+                continue
+            b = int(((_f(r.get("t_pick")) or t0) - t0) / bin_s)
+            h = control_hops(r, pico_min)
+            dst = bins.setdefault(b, {k: [] for k in keys})
+            for k in ("chain", "ik", "period", "interp", "pico"):
+                if h.get(k) is not None:
+                    dst[k].append(h[k])
+        lag_by_bin = {}
+        step = max(1, int(round(bin_s * 50)))
+        for i in range(0, len(track), step * 5):          # follow lag on 5 s windows, spread over its bins
+            w = track[i:i + 250]
+            lg = follow_lag(w)[0]
+            if lg is not None:
+                b = int(((_f(w[0].get("t")) or t0) - t0) / bin_s)
+                for j in range(5):
+                    lag_by_bin[b + j] = lg
+        s = {k: [] for k in ("t",) + keys}
+        for b in sorted(bins):
+            v = {k: pct(bins[b][k], 0.5) for k in ("chain", "ik", "period", "interp", "pico")}
+            v["follow"] = lag_by_bin.get(b)
+            v["e2e"] = (v["chain"] + (v["pico"] or 0) + (v["follow"] or 0)) if v["chain"] is not None else None
+            s["t"].append(round(b * bin_s, 1))
+            for k in keys:
+                s[k].append(_r(v[k]))
+        out["series"] = s
+    return out
+
+
+def list_runs(logs_dir, limit=50):
+    """Runs (real_*) that have latency files, newest first: name, start (unix), size."""
+    out = []
+    try:
+        import re
+        names = sorted((n for n in os.listdir(logs_dir) if re.fullmatch(r"real_\d{8}_\d{6}", n)
+                        and not os.path.islink(os.path.join(logs_dir, n))), reverse=True)
+    except OSError:
+        return out
+    for n in names:
+        p = os.path.join(logs_dir, n, "lat_control.csv")
+        if os.path.isfile(p):
+            st = os.stat(p)
+            try:
+                start = time.mktime(time.strptime(n[5:20], "%Y%m%d_%H%M%S"))
+            except ValueError:
+                start = None
+            out.append({"run": n, "start": start, "updated": st.st_mtime, "bytes": st.st_size})
+            if len(out) >= limit:
+                break
+    return out
 
 
 def _pad(s, w=40):
@@ -380,49 +490,67 @@ def _pad(s, w=40):
     return s + " " * max(1, w - n)
 
 
-def render(title, rows, hops, n_new, lag, nj, rms):
+def render(title, s):
     out = [title, "", _pad("环节") + f"{'p50':>9}{'p90':>9}{'max':>9}   (ms)"]
-    for k, label in HOPS:
-        xs = hops.get(k, [])
-        if xs:
-            out.append(_pad(label) + "".join(f"{pct(xs, p):9.1f}" for p in (0.5, 0.9, 1.0)))
+    for h in s["hops"]:
+        if h["key"] == "follow":
+            continue
+        if h["p50"] is None:
+            out.append(_pad(h["label"]) + f"{'—':>9}")
         else:
-            out.append(_pad(label) + f"{'—':>9}")
+            out.append(_pad(h["label"]) + "".join(f"{h[k]:9.1f}" for k in ("p50", "p90", "max")))
+    lag = s["follow_lag_ms"]
     out.append(_pad("[11] 机器人跟随滞后 (实测 vs 指令)")
-               + (f"{lag:9.0f}   ({nj} 个关节在动, 跟随误差 RMS {rms:.1f}°)" if lag is not None else
+               + (f"{lag:9.0f}   (跟随误差 RMS {s['follow_rms_deg'] or 0:.1f}°)" if lag is not None else
                   f"{'—':>9}   (手臂没在动或数据不足)"))
-    if rows:
-        reuse = 100.0 * (1 - n_new / len(rows))
-        raw = hops.get("pico_raw", [])
+    if s["frames"]:
         out.append("")
-        out.append(f"帧数 {len(rows)}，其中 PICO 数据没更新的重复帧 {reuse:.0f}%"
-                   + (f"；PICO 时钟差 p50 {pct(raw, 0.5):.0f} ms（两边时钟同步时即 Wi‑Fi 绝对延迟）" if raw else ""))
-        chain = hops.get("chain", [])
-        if chain:
-            est = (pct(hops.get("pico", [0]), 0.5) or 0) + pct(chain, 0.5) + (lag or 0)
-            out.append(f"估算 PICO 动作→机器人到位（p50）：约 {est:.0f} ms = [1] + 工作站内合计 + [11]")
+        out.append(f"帧数 {s['frames']}，其中 PICO 数据没更新的重复帧 {s['pico_repeat_pct']:.0f}%"
+                   + (f"；PICO 时钟差 p50 {s['pico_clock_ms']:.0f} ms（两边时钟同步时即 Wi‑Fi 绝对延迟）"
+                      if s["pico_clock_ms"] is not None else ""))
+        if s["e2e_ms"] is not None:
+            out.append(f"估算 PICO 动作→机器人到位（p50）：约 {s['e2e_ms']:.0f} ms = [1] + 工作站内合计 + [11]")
     return "\n".join(out)
 
 
-def cmd_watch(d, window=5.0):
-    tc, tt = Tail(os.path.join(d, "lat_control.csv")), Tail(os.path.join(d, "lat_track.csv"))
-    ctrl, track, pico_min = [], [], None
-    while True:
-        new = tc.read()
+class Live:
+    """Incremental reader of a run's latency files for a rolling window (watch, g1_hub)."""
+
+    def __init__(self, d, window=5.0):
+        self.d, self.window = d, window
+        self.tc, self.tt = Tail(os.path.join(d, "lat_control.csv")), Tail(os.path.join(d, "lat_track.csv"))
+        self.ctrl, self.track, self.pico_min, self.last_t = [], [], None, None
+
+    def update(self):
+        new = self.tc.read()
         for r in new:
-            g = _f(r.get("wall_ns")), _f(r.get("pico_ts_ns"))
-            if g[0] and g[1]:
-                v = (g[0] - g[1]) / 1e6
-                pico_min = v if pico_min is None else min(pico_min, v)
-        ctrl.extend(new)
-        track.extend(tt.read())
-        now = max([_f(r.get("t_pick")) or 0 for r in ctrl[-1:]] + [_f(r.get("t")) or 0 for r in track[-1:]] + [0])
-        ctrl = [r for r in ctrl if (_f(r.get("t_pick")) or 0) > now - window]
-        track = [r for r in track if (_f(r.get("t")) or 0) > now - window]
-        rows, hops, n_new, lag, nj, rms = summarize(ctrl, track, pico_min)
-        title = f"G1 DWBC 控制链延迟  {os.path.basename(d)}  最近 {window:.0f} s（只算手臂跟随中的帧）  {time.strftime('%H:%M:%S')}"
-        body = render(title, rows, hops, n_new, lag, nj, rms)
-        if not rows:
+            v = pico_offset(r)
+            if v is not None:
+                self.pico_min = v if self.pico_min is None else min(self.pico_min, v)
+        self.ctrl.extend(new)
+        self.track.extend(self.tt.read())
+        ts = [_f(r.get("t_pick")) for r in self.ctrl[-1:]] + [_f(r.get("t")) for r in self.track[-1:]]
+        ts = [t for t in ts if t is not None]
+        if ts:
+            self.last_t = max(ts)
+            now = self.last_t
+            self.ctrl = [r for r in self.ctrl if (_f(r.get("t_pick")) or 0) > now - self.window]
+            self.track = [r for r in self.track if (_f(r.get("t")) or 0) > now - self.window]
+        s = summary(self.ctrl, self.track, self.pico_min, self.window)
+        s["run"] = os.path.basename(self.d)
+        # newest row's age on the shared CLOCK_MONOTONIC (same machine as the loops)
+        s["age_ms"] = _r((time.monotonic() - self.last_t) * 1e3, 0) if self.last_t is not None else None
+        return s
+
+
+def cmd_watch(d, window=5.0):
+    live = Live(d, window)
+    while True:
+        s = live.update()
+        title = (f"G1 DWBC 控制链延迟  {os.path.basename(d)}  最近 {window:.0f} s（只算手臂跟随中的帧）  "
+                 f"{time.strftime('%H:%M:%S')}")
+        body = render(title, s)
+        if not s["frames"]:
             body += "\n\n（还没有手臂跟随中的帧：等 A+X 开始跟随，或链路没在跑）"
         sys.stdout.write("\033[H\033[2J" + body + "\n")
         sys.stdout.flush()
@@ -430,24 +558,8 @@ def cmd_watch(d, window=5.0):
 
 
 def cmd_report(d):
-    ctrl = Tail(os.path.join(d, "lat_control.csv")).read()
-    track = Tail(os.path.join(d, "lat_track.csv")).read()
-    vals = [(_f(r.get("wall_ns")), _f(r.get("pico_ts_ns"))) for r in ctrl]
-    offs = [(a - b) / 1e6 for a, b in vals if a and b]
-    pico_min = min(offs) if offs else None
-    rows, hops, n_new, lag, nj, rms = summarize(ctrl, [], pico_min)
-    # follow lag: median over 5 s windows in which the arms moved
-    lags = []
-    for i in range(0, len(track), 250):
-        lg, n, _ = follow_lag(track[i:i + 250])
-        if lg is not None:
-            lags.append(lg)
-    _, _, rms = follow_lag(track) if track else (None, 0, None)
-    lag = pct(lags, 0.5) if lags else None
-    txt = render(f"G1 DWBC 控制链延迟  {os.path.basename(d)}  整场（只算手臂跟随中的帧）", rows, hops, n_new, lag,
-                 len(lags), rms or 0.0)
-    if lag is not None:
-        txt = txt.replace(f"({len(lags)} 个关节在动", f"({len(lags)} 个 5 s 窗口的中位数")
+    s = run_summary(d, series=False)
+    txt = render(f"G1 DWBC 控制链延迟  {os.path.basename(d)}  整场（只算手臂跟随中的帧；[11] 是各 5 s 窗口的中位数）", s)
     print(txt)
     with open(os.path.join(d, "lat_summary.txt"), "w") as f:
         f.write(txt + "\n")
