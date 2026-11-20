@@ -111,3 +111,38 @@ unshare -rn bash ~/piper_ws/dwbc/dwbc_dryrun.sh       # 真机代码路径对假
 - 真机上电后的整条链路：释放模式、站立、PICO 遥操、Dex1 夹爪。2026-11-17 只做了只读预检，全部通过：lowstate 和躯干 IMU 都是 1035 Hz，mode_machine 5，两侧 Dex1 501 Hz，当时处在宇树 ai 模式。
 - 实际戴着 PICO 的遥操：遥操进程能连上 XRoboToolkit 服务，但头显当时没有数据。
 - 数据导出 `run_g1_data_exporter.py`：需要 lerobot，还没装。
+
+## 控制链路延迟监控（2026-11-20）
+
+`dwbc_latency.py` 在 teleop 和 control 两个进程里给每一段打时间戳，默认开启（`DWBC_LATENCY=0` 关闭）。它只计时，不改变两个循环算出的任何结果；teleop 发出的目标消息里会多一个 `lat` 字段（时间戳），control 进程不读它。监控代码出错时会打印一行并自动关闭，不会影响控制。
+
+每次真机运行，下面三个文件写进那次的日志目录 `dwbc_logs/real_<时间>/`：
+
+- `lat_teleop.csv`：teleop 每一帧一行
+- `lat_control.csv`：control 每取走一个目标一行，[1]–[10] 全在这一行里
+- `lat_track.csv`：control 每圈一行，记录手臂 14 个关节的指令值和实测值，用来算 [11]
+
+```bash
+python3 ~/piper_ws/dwbc/dwbc_latency.py watch          # 实时，每秒刷新，统计最近 5 s
+python3 ~/piper_ws/dwbc/dwbc_latency.py report [目录]   # 整场汇总，同时写 lat_summary.txt
+ssh -t workstation-lan python3 ~/piper_ws/dwbc/dwbc_latency.py watch   # 在 Mac 上看
+```
+
+| 段 | 含义 | 量法 |
+| --- | --- | --- |
+| [1] PICO 采样→teleop 读到 | Wi‑Fi 加上数据在服务里等待被读的时间 | 工作站时钟减去 PICO 时间戳。两边时钟没对齐，所以显示的是超出整场最小值的部分；原始差值另外列出 |
+| [2] teleop 周期 | 两次读手柄的间隔，目标 50 ms | — |
+| [3] 读手柄+位姿处理 | `TeleopStreamer.get_streamer_data` | — |
+| [4] 手臂 IK | `TeleopRetargetingIK.get_action`；`DWBC_IK_GLOBAL=1` 时走多起点 IK | — |
+| [5] teleop 其它 | 激活判断、A+B+X+Y 回站姿等 | — |
+| [6-7] 打包+ROS 2 传输 | msgpack 打包、发布，到 control 的回调收到 | — |
+| [8] 等控制环取走 | 消息到达后，等 50 Hz 循环来取 | — |
+| [9] 控制环计算→lowcmd | 取走后到 `rt/lowcmd` 写出（腿部策略、安全检查） | — |
+| [10] 插值到位 | 取走后到插值轨迹到达这一帧目标的时刻 | 至少是发布时刻 +50 ms；手臂速度上限 `DWBC_ARM_SPEED`（3 rad/s）起作用时更长 |
+| [11] 机器人跟随滞后 | 实测关节相对指令关节的滞后 | 互相关；只算 5 s 内动了 3° 以上的关节，先去掉均值（重力下垂是偏差，不算滞后） |
+
+最后的“估算 PICO 动作→机器人到位”= [1] + 工作站内合计（读到→指令到位）+ [11]。所有统计只算手臂在跟随的帧，也就是 A+X 打开之后。
+
+**仿真自测**（不需要机器人和头显）：`unshare -rn bash ~/piper_ws/dwbc/tests/lat_sim_test.sh 30`。脚本在独立的网络命名空间里运行，ROS 用 domain 78，用假 PICO 驱动手臂，碰不到真机链路。
+
+2026-11-20 的自测结果（MuJoCo 和多起点 IK 同时在跑）：工作站内合计 p50 136 ms；其中 IK p50 36 ms、p90 146 ms，插值 p50 46 ms。

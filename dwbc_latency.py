@@ -1,0 +1,462 @@
+"""Per-hop latency monitor for the decoupled-WBC PICO teleop chain (2026-11-20).
+
+Control chain (all stamps on the workstation's CLOCK_MONOTONIC, shared by both processes, except the PICO's own clock):
+
+  PICO headset --Wi-Fi--> xrobotoolkit-pc-service (:63901) --SDK--> teleop process (dwbc_run.py teleop, 20 Hz)
+      [1] PICO sample -> read by teleop    pico_streamer reads the latest pose; age = wall clock - PICO timestamp,
+                                           shown above its minimum (the two clocks are not synchronised)
+      [2] teleop period                    time between two reads (the loop is 20 Hz = 50 ms when on time)
+      [3] streamer                         TeleopStreamer.get_streamer_data (SDK read + pose processing)
+      [4] arm IK                           TeleopRetargetingIK.get_action (body IK, multi-start when DWBC_IK_GLOBAL=1)
+      [5] teleop other                     rest of TeleopPolicy.get_action (activation, A+B+X+Y return, ...)
+      [6] publish                          msgpack + ROS 2 publish of the goal (CONTROL_GOAL_TOPIC)
+  --ROS 2 (domain 77, loopback)--> control process (dwbc_run.py control, 50 Hz)
+      [7] ROS transport                    publish -> subscriber callback
+      [8] wait for control loop            callback -> the 50 Hz loop picks the message up
+      [9] control -> lowcmd                pick-up -> G1Env.queue_action wrote rt/lowcmd (policy + safety)
+      [10] interpolation                   pick-up -> time the interpolated arm trajectory reaches this target
+                                           (target_time = publish + 50 ms, longer when the joint speed cap binds)
+  --DDS rt/lowcmd over enp13s0--> G1 motors
+      [11] robot follow lag                measured arm joints vs commanded arm joints (cross-correlation)
+
+Recording (inside the two processes, installed by dwbc_run.py when DWBC_LATENCY != "0"):
+  <run dir>/lat_teleop.csv    one row per teleop frame
+  <run dir>/lat_control.csv   one row per goal the control loop picked up (the whole chain [1]-[10] in one row)
+  <run dir>/lat_track.csv     one row per control cycle: commanded and measured arm joints (for [11])
+  The run dir is $DWBC_LAT_DIR, else the directory of the process's stdout log (dwbc_real.sh: real_<stamp>/).
+  The instrumentation never changes what the loops compute and never raises into them: on any error it prints
+  once and switches itself off.
+
+Live view / summary (stdlib only, any python3):
+  python3 ~/piper_ws/dwbc/dwbc_latency.py watch [run dir]      # refreshes every second, last 5 s
+  python3 ~/piper_ws/dwbc/dwbc_latency.py report [run dir]     # whole run, also writes lat_summary.txt
+  default run dir: ~/piper_ws/dwbc_logs/real_latest
+"""
+import os
+import sys
+import time
+
+# ------------------------------------------------------------------------------------------------ instrumentation
+TELEOP_COLS = ["seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms", "streamer_ms", "ik_ms",
+               "action_ms", "pub_ms", "active"]
+CONTROL_COLS = ["seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms", "streamer_ms", "ik_ms",
+                "action_ms", "t_pub", "t_arrive", "t_pick", "t_target", "t_waypoint", "t_sent", "active"]
+N_ARM = 14
+
+_on = True
+_files = {}
+_last_flush = 0.0
+
+
+def _off(where, e):
+    global _on
+    if _on:
+        _on = False
+        print(f"[dwbc_latency] disabled after an error in {where}: {e!r} (control is not affected)", flush=True)
+
+
+def _safe(where, fn, *a):
+    if not _on:
+        return None
+    try:
+        return fn(*a)
+    except Exception as e:  # noqa: BLE001 - instrumentation must never break the loops
+        _off(where, e)
+        return None
+
+
+def _run_dir():
+    d = os.environ.get("DWBC_LAT_DIR")
+    if not d:
+        try:
+            p = os.readlink("/proc/self/fd/1")
+            if os.path.isfile(p):
+                d = os.path.dirname(p)
+        except OSError:
+            pass
+    if not d or not os.access(d, os.W_OK):
+        d = os.path.join(os.environ.get("DWBC_LOGS", os.path.expanduser("~/piper_ws/dwbc_logs")),
+                         "lat_" + time.strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _open(name, cols):
+    path = os.path.join(_run_dir(), name)
+    f = open(path, "a", buffering=1 << 16)
+    if f.tell() == 0:
+        f.write(",".join(cols) + "\n")
+    _files[name] = f
+    print(f"[dwbc_latency] recording {path}", flush=True)
+    return f
+
+
+def _write(name, line):
+    global _last_flush
+    _files[name].write(line + "\n")
+    now = time.monotonic()
+    if now - _last_flush > 0.5:
+        _last_flush = now
+        for f in _files.values():
+            f.flush()
+
+
+def _fmt(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, int):
+        return str(v)
+    return f"{v:.6f}"
+
+
+def _wrap(cls, name, pre, post):
+    """cls.name runs exactly as before; pre(self, *a) / post(self, ctx, result) are guarded."""
+    orig = getattr(cls, name)
+
+    def wrapped(self, *a, **k):
+        ctx = _safe(f"{cls.__name__}.{name}", pre, self, *a) if pre else None
+        r = orig(self, *a, **k)
+        if post:
+            _safe(f"{cls.__name__}.{name}", post, self, ctx, r)
+        return r
+
+    wrapped.__wrapped__ = orig
+    setattr(cls, name, wrapped)
+
+
+# ----- teleop process
+_tp = {"seq": 0, "last_ts": None, "last_read": None}
+
+
+def install_teleop():
+    from decoupled_wbc.control.policy import teleop_policy as TP
+    from decoupled_wbc.control.teleop import teleop_retargeting_ik as TRI
+    from decoupled_wbc.control.teleop import teleop_streamer as TS
+    from decoupled_wbc.control.teleop.streamers import pico_streamer as PS
+    from decoupled_wbc.control.utils import ros_utils as RU
+
+    _open("lat_teleop.csv", TELEOP_COLS)
+    mono = time.monotonic
+
+    def pico_post(self, ctx, d):
+        t = mono()
+        ts = int(d.get("timestamp") or 0)
+        _tp["t_read"], _tp["wall_ns"], _tp["pico_ts_ns"] = t, time.time_ns(), ts
+        _tp["pico_new"] = ts != _tp["last_ts"]
+        _tp["period_ms"] = None if _tp["last_read"] is None else (t - _tp["last_read"]) * 1e3
+        _tp["last_ts"], _tp["last_read"] = ts, t
+
+    _wrap(PS.PicoStreamer, "_get_pico_data", None, pico_post)
+    _wrap(TS.TeleopStreamer, "get_streamer_data", lambda self: mono(),
+          lambda self, t0, r: _tp.__setitem__("streamer_ms", (mono() - t0) * 1e3))
+    _wrap(TRI.TeleopRetargetingIK, "get_action", lambda self: mono(),
+          lambda self, t0, r: _tp.__setitem__("ik_ms", (mono() - t0) * 1e3))
+
+    def act_pre(self):
+        for k in ("t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms", "streamer_ms", "ik_ms"):
+            _tp[k] = None
+        return mono()
+
+    def act_post(self, t0, action):
+        _tp["seq"] += 1
+        _tp["action_ms"] = (mono() - t0) * 1e3
+        _tp["active"] = bool(getattr(self, "is_active", False))
+        if isinstance(action, dict):
+            action["lat"] = {k: _tp.get(k) for k in ("seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new",
+                                                        "period_ms", "streamer_ms", "ik_ms", "action_ms", "active")}
+
+    _wrap(TP.TeleopPolicy, "get_action", act_pre, act_post)
+
+    def pub_pre(self, msg):
+        return mono() if isinstance(msg, dict) and "lat" in msg else None
+
+    def pub_post(self, t0, r):
+        if t0 is None:
+            return
+        row = dict(_tp, pub_ms=(mono() - t0) * 1e3)
+        _write("lat_teleop.csv", ",".join(_fmt(row.get(c)) for c in TELEOP_COLS))
+
+    _wrap(RU.ROSMsgPublisher, "publish", pub_pre, pub_post)
+    print("[dwbc_latency] teleop instrumentation on", flush=True)
+
+
+# ----- control process
+_cp = {"pending": None, "obs_q": None, "arms": None}
+
+
+def install_control():
+    from decoupled_wbc.control.envs.g1 import g1_env as GE
+    from decoupled_wbc.control.policy import interpolation_policy as IP
+    from decoupled_wbc.control.utils import ros_utils as RU
+
+    _open("lat_control.csv", CONTROL_COLS)
+    _open("lat_track.csv", ["t"] + [f"cmd{i}" for i in range(N_ARM)] + [f"meas{i}" for i in range(N_ARM)])
+    mono = time.monotonic
+
+    # arrival time of the newest message (ROS executor thread); the class attribute is bound at subscription time
+    _wrap(RU.ROSMsgSubscriber, "_callback", None, lambda self, ctx, r: setattr(self, "_lat_arrive", mono()))
+
+    def get_post(self, ctx, msg):
+        if isinstance(msg, dict) and isinstance(msg.get("lat"), dict):
+            row = dict(msg["lat"])
+            row.update(t_pub=msg.get("timestamp"), t_target=msg.get("target_time"),
+                       t_arrive=getattr(self, "_lat_arrive", None), t_pick=mono())
+            _cp["pending"] = row
+
+    _wrap(RU.ROSMsgSubscriber, "get_msg", None, get_post)
+
+    def goal_post(self, ctx, r):
+        if _cp["pending"] is not None and "t_waypoint" not in _cp["pending"]:
+            # the speed-capped time of the waypoint just scheduled (self.last_waypoint_time is only target_time)
+            _cp["pending"]["t_waypoint"] = float(self.interp.times[-1])
+
+    _wrap(IP.InterpolationPolicy, "set_goal", None, goal_post)
+
+    def obs_post(self, ctx, obs):
+        _cp["obs_q"] = obs.get("q") if isinstance(obs, dict) else None
+
+    _wrap(GE.G1Env, "observe", None, obs_post)
+
+    def queue_post(self, ctx, r):
+        t = mono()
+        row, _cp["pending"] = _cp["pending"], None
+        if row is not None:
+            row["t_sent"] = t
+            _write("lat_control.csv", ",".join(_fmt(row.get(c)) for c in CONTROL_COLS))
+        q, cmd = _cp["obs_q"], ctx
+        if q is not None and cmd is not None:
+            if _cp["arms"] is None:
+                _cp["arms"] = list(self.robot_model.get_joint_group_indices("arms"))[:N_ARM]
+            a = _cp["arms"]
+            _write("lat_track.csv", f"{t:.4f}," + ",".join(f"{cmd[i]:.4f}" for i in a) + ","
+                   + ",".join(f"{q[i]:.4f}" for i in a))
+
+    _wrap(GE.G1Env, "queue_action", lambda self, action: action["q"].copy(), queue_post)
+    print("[dwbc_latency] control instrumentation on", flush=True)
+
+
+def install(mode):
+    """Called by dwbc_run.py before the upstream entry point runs; never raises."""
+    try:
+        {"teleop": install_teleop, "control": install_control}[mode]()
+    except Exception as e:  # noqa: BLE001
+        _off(f"install({mode})", e)
+
+
+# ------------------------------------------------------------------------------------------------ viewer / report
+HOPS = [  # key, label
+    ("pico", "[1] PICO采样→teleop读到 (超出最小值)"),
+    ("period", "[2] teleop 周期 (目标 50)"),
+    ("streamer", "[3] 读手柄+位姿处理"),
+    ("ik", "[4] 手臂 IK"),
+    ("other", "[5] teleop 其它"),
+    ("ros", "[6-7] 打包+ROS 2 传输"),
+    ("wait", "[8] 等控制环取走"),
+    ("ctrl", "[9] 控制环计算→lowcmd"),
+    ("interp", "[10] 插值到位 (含限速)"),
+    ("chain", "工作站内合计 读到→指令到位"),
+]
+
+
+def _f(x):
+    try:
+        return float(x) if x != "" else None
+    except ValueError:
+        return None
+
+
+class Tail:
+    """Reads the complete lines appended to a CSV since the last call."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.cols, self.buf = path, 0, None, ""
+
+    def read(self):
+        try:
+            with open(self.path) as f:
+                f.seek(self.pos)
+                data = f.read()
+                self.pos = f.tell()
+        except OSError:
+            return []
+        data = self.buf + data
+        lines = data.split("\n")
+        self.buf = lines.pop()
+        out = []
+        for ln in lines:
+            if not ln:
+                continue
+            parts = ln.split(",")
+            if self.cols is None:
+                self.cols = parts
+                continue
+            out.append(dict(zip(self.cols, parts)))
+        return out
+
+
+def control_hops(r, pico_min):
+    """r: a lat_control.csv row (strings). Returns {hop: ms} for the hops present."""
+    g = {k: _f(v) for k, v in r.items()}
+    h = {}
+    if g.get("wall_ns") and g.get("pico_ts_ns"):
+        h["pico_raw"] = (g["wall_ns"] - g["pico_ts_ns"]) / 1e6
+        if pico_min is not None:
+            h["pico"] = h["pico_raw"] - pico_min
+    for k, c in (("period", "period_ms"), ("streamer", "streamer_ms"), ("ik", "ik_ms")):
+        if g.get(c) is not None:
+            h[k] = g[c]
+    if g.get("action_ms") is not None:
+        h["other"] = max(0.0, g["action_ms"] - (g.get("streamer_ms") or 0) - (g.get("ik_ms") or 0))
+
+    def d(a, b):
+        return (g[b] - g[a]) * 1e3 if g.get(a) is not None and g.get(b) is not None else None
+
+    for k, a, b in (("ros", "t_pub", "t_arrive"), ("wait", "t_arrive", "t_pick"), ("ctrl", "t_pick", "t_sent"),
+                    ("interp", "t_pick", "t_waypoint"), ("chain", "t_read", "t_waypoint")):
+        v = d(a, b)
+        if v is not None:
+            h[k] = v
+    return h
+
+
+def pct(xs, p):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(round(p * (len(xs) - 1))))]
+
+
+def follow_lag(rows, max_lag=40):
+    """Robot follow lag (ms) of the arm joints: for each moving joint the shift of the command that best matches the
+    measurement (mean removed: gravity sag is an offset, not a lag). Returns (lag_ms, n_joints, rms_err_deg)."""
+    if len(rows) < 60:
+        return None, 0, None
+    t = [_f(r["t"]) for r in rows]
+    dt = (t[-1] - t[0]) / (len(t) - 1)
+    lags, errs = [], []
+    for j in range(N_ARM):
+        c = [_f(r.get(f"cmd{j}")) for r in rows]
+        m = [_f(r.get(f"meas{j}")) for r in rows]
+        if None in c or None in m:
+            continue
+        errs.extend((a - b) ** 2 for a, b in zip(c, m))
+        if max(c) - min(c) < 0.05:     # < 3 deg of motion: no lag to measure
+            continue
+        n = len(c)
+        best = None
+        for L in range(0, min(max_lag, n // 3) + 1):
+            cc, mm = c[:n - L], m[L:]
+            mc, mmn = sum(cc) / len(cc), sum(mm) / len(mm)
+            e = sum((a - mc - (b - mmn)) ** 2 for a, b in zip(cc, mm)) / len(cc)
+            if best is None or e < best[0]:
+                best = (e, L)
+        lags.append(best[1] * dt * 1e3)
+    rms = (sum(errs) / len(errs)) ** 0.5 * 57.2958 if errs else None
+    return (pct(lags, 0.5) if lags else None), len(lags), rms
+
+
+def resolve_dir(arg):
+    d = arg or os.path.expanduser("~/piper_ws/dwbc_logs/real_latest")
+    return os.path.realpath(d)
+
+
+def summarize(ctrl_rows, track_rows, pico_min, active_only=True):
+    rows = [r for r in ctrl_rows if not active_only or r.get("active") == "1"]
+    hops = {}
+    for r in rows:
+        for k, v in control_hops(r, pico_min).items():
+            hops.setdefault(k, []).append(v)
+    new = [r for r in rows if r.get("pico_new") == "1"]
+    lag, nj, rms = follow_lag(track_rows)
+    return rows, hops, len(new), lag, nj, rms
+
+
+def _pad(s, w=40):
+    """left-justify to w terminal columns (CJK characters are 2 columns wide)"""
+    import unicodedata
+    n = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return s + " " * max(1, w - n)
+
+
+def render(title, rows, hops, n_new, lag, nj, rms):
+    out = [title, "", _pad("环节") + f"{'p50':>9}{'p90':>9}{'max':>9}   (ms)"]
+    for k, label in HOPS:
+        xs = hops.get(k, [])
+        if xs:
+            out.append(_pad(label) + "".join(f"{pct(xs, p):9.1f}" for p in (0.5, 0.9, 1.0)))
+        else:
+            out.append(_pad(label) + f"{'—':>9}")
+    out.append(_pad("[11] 机器人跟随滞后 (实测 vs 指令)")
+               + (f"{lag:9.0f}   ({nj} 个关节在动, 跟随误差 RMS {rms:.1f}°)" if lag is not None else
+                  f"{'—':>9}   (手臂没在动或数据不足)"))
+    if rows:
+        reuse = 100.0 * (1 - n_new / len(rows))
+        raw = hops.get("pico_raw", [])
+        out.append("")
+        out.append(f"帧数 {len(rows)}，其中 PICO 数据没更新的重复帧 {reuse:.0f}%"
+                   + (f"；PICO 时钟差 p50 {pct(raw, 0.5):.0f} ms（两边时钟同步时即 Wi‑Fi 绝对延迟）" if raw else ""))
+        chain = hops.get("chain", [])
+        if chain:
+            est = (pct(hops.get("pico", [0]), 0.5) or 0) + pct(chain, 0.5) + (lag or 0)
+            out.append(f"估算 PICO 动作→机器人到位（p50）：约 {est:.0f} ms = [1] + 工作站内合计 + [11]")
+    return "\n".join(out)
+
+
+def cmd_watch(d, window=5.0):
+    tc, tt = Tail(os.path.join(d, "lat_control.csv")), Tail(os.path.join(d, "lat_track.csv"))
+    ctrl, track, pico_min = [], [], None
+    while True:
+        new = tc.read()
+        for r in new:
+            g = _f(r.get("wall_ns")), _f(r.get("pico_ts_ns"))
+            if g[0] and g[1]:
+                v = (g[0] - g[1]) / 1e6
+                pico_min = v if pico_min is None else min(pico_min, v)
+        ctrl.extend(new)
+        track.extend(tt.read())
+        now = max([_f(r.get("t_pick")) or 0 for r in ctrl[-1:]] + [_f(r.get("t")) or 0 for r in track[-1:]] + [0])
+        ctrl = [r for r in ctrl if (_f(r.get("t_pick")) or 0) > now - window]
+        track = [r for r in track if (_f(r.get("t")) or 0) > now - window]
+        rows, hops, n_new, lag, nj, rms = summarize(ctrl, track, pico_min)
+        title = f"G1 DWBC 控制链延迟  {os.path.basename(d)}  最近 {window:.0f} s（只算手臂跟随中的帧）  {time.strftime('%H:%M:%S')}"
+        body = render(title, rows, hops, n_new, lag, nj, rms)
+        if not rows:
+            body += "\n\n（还没有手臂跟随中的帧：等 A+X 开始跟随，或链路没在跑）"
+        sys.stdout.write("\033[H\033[2J" + body + "\n")
+        sys.stdout.flush()
+        time.sleep(1.0)
+
+
+def cmd_report(d):
+    ctrl = Tail(os.path.join(d, "lat_control.csv")).read()
+    track = Tail(os.path.join(d, "lat_track.csv")).read()
+    vals = [(_f(r.get("wall_ns")), _f(r.get("pico_ts_ns"))) for r in ctrl]
+    offs = [(a - b) / 1e6 for a, b in vals if a and b]
+    pico_min = min(offs) if offs else None
+    rows, hops, n_new, lag, nj, rms = summarize(ctrl, [], pico_min)
+    # follow lag: median over 5 s windows in which the arms moved
+    lags = []
+    for i in range(0, len(track), 250):
+        lg, n, _ = follow_lag(track[i:i + 250])
+        if lg is not None:
+            lags.append(lg)
+    _, _, rms = follow_lag(track) if track else (None, 0, None)
+    lag = pct(lags, 0.5) if lags else None
+    txt = render(f"G1 DWBC 控制链延迟  {os.path.basename(d)}  整场（只算手臂跟随中的帧）", rows, hops, n_new, lag,
+                 len(lags), rms or 0.0)
+    if lag is not None:
+        txt = txt.replace(f"({len(lags)} 个关节在动", f"({len(lags)} 个 5 s 窗口的中位数")
+    print(txt)
+    with open(os.path.join(d, "lat_summary.txt"), "w") as f:
+        f.write(txt + "\n")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in ("watch", "report"):
+        sys.exit(__doc__)
+    try:
+        (cmd_watch if sys.argv[1] == "watch" else cmd_report)(resolve_dir(sys.argv[2] if len(sys.argv) > 2 else None))
+    except KeyboardInterrupt:
+        pass

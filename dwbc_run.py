@@ -10,6 +10,7 @@ DWBC_IK_POSTURE_COST e.g. "0.1": arm IK posture task weight for the teleop loop 
 DWBC_IK_GLOBAL   "1": multi-start (global) arm IK for the teleop loop (dwbc_ik_global.py).
 DWBC_ABXY_RESET  "1": A+B+X+Y returns slowly to the standing pose (dwbc_teleop_ext.py).
 DWBC_KP_SCALE    optional, e.g. "0.8": scales every MOTOR_KP (not used by default).
+DWBC_LATENCY     "0" turns off the per-hop latency recording (dwbc_latency.py; on by default).
 """
 import os
 import runpy
@@ -85,6 +86,18 @@ if _pc and sys.argv[1] == "teleop":
 
     _BS.BodyIKSolverSettings.__init__ = _bs_init_tuned
     print(f"[dwbc_run] arm IK posture_cost={float(_pc)} (upstream 0.01)", flush=True)
+# DWBC_LATENCY (default on, 2026-11-20): per-hop latency recording of the PICO -> robot chain (dwbc_latency.py next to
+# this file; lat_*.csv in the run's log dir; live view: python3 dwbc_latency.py watch). Installed last so it wraps the
+# patches above. It only times calls; the one thing it adds is a "lat" entry (stamps) in the teleop goal message,
+# which the control loop does not read. "0" turns it off.
+if os.environ.get("DWBC_LATENCY", "1") != "0":
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dwbc_latency
+
+        dwbc_latency.install(sys.argv[1])
+    except Exception as _e:  # noqa: BLE001 - never block the control chain over the monitor
+        print(f"[dwbc_run] latency monitor not installed: {_e!r}", flush=True)
 sys.argv = [mod] + sys.argv[2:]
 # DWBC_ENABLE_WAIST=1 (default in dwbc_env.sh since 2026-11-17): waist joints join the arm IK and the resulting torso
 # lean is passed to the leg policy as its rpy command (upstream --enable-waist). Control loop and teleop must agree.
