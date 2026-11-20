@@ -1,0 +1,536 @@
+From 2287550e21b4ec1cd2ec71b97e7d9e7f7f71960e Mon Sep 17 00:00:00 2001
+From: lihao <lihao@workstation.local>
+Date: Fri, 20 Nov 2026 11:06:02 +0800
+Subject: [PATCH] G1 workstation local changes on top of upstream 45c03fa
+
+- run_g1_control_loop.py: Decoupled WBC control loop tweaks used on the real G1
+- pico_streamer.py: PICO key mapping (A+B+X+Y / A+X) matched to the SONIC flow
+- pico_manager_thread_server.py: SONIC PICO streamer changes
+- gear_sonic_deploy/policy/low_latency/observation_config.yaml: added
+
+Recorded as found on 2026-11-20; the .git/index was missing before this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../main/teleop/run_g1_control_loop.py        |  24 +-
+ .../control/teleop/streamers/pico_streamer.py |  59 ++++-
+ .../scripts/pico_manager_thread_server.py     | 220 +++++++++++-------
+ .../low_latency/observation_config.yaml       |  92 ++++++++
+ 4 files changed, 309 insertions(+), 86 deletions(-)
+ create mode 100644 gear_sonic_deploy/policy/low_latency/observation_config.yaml
+
+diff --git a/decoupled_wbc/control/main/teleop/run_g1_control_loop.py b/decoupled_wbc/control/main/teleop/run_g1_control_loop.py
+index 2cec57f..c8dd9d7 100644
+--- a/decoupled_wbc/control/main/teleop/run_g1_control_loop.py
++++ b/decoupled_wbc/control/main/teleop/run_g1_control_loop.py
+@@ -36,6 +36,17 @@ from decoupled_wbc.control.utils.telemetry import Telemetry
+ CONTROL_NODE_NAME = "ControlPolicy"
+ 
+ 
++def _dispatch_key(dispatcher, key):
++    """PICO A / B (data collection start / abort) and the sim reset key go through dispatcher.handle_key, which
++    only the local KeyboardDispatcher has. The real robot runs a ROSKeyboardDispatcher: calling it raised
++    AttributeError and killed the control loop (2026-11-17, PICO B). Recording is done by the g1_hub recorder,
++    so on the real robot these keys are ignored (logged)."""
++    if hasattr(dispatcher, "handle_key"):
++        dispatcher.handle_key(key)
++    else:
++        print(f"[dwbc] PICO key '{key}' ignored (data collection is not used on the real robot)", flush=True)
++
++
+ def main(config: ControlLoopConfig):
+     ros_manager = ROSManager(node_name=CONTROL_NODE_NAME)
+     node = ros_manager.node
+@@ -157,16 +168,23 @@ def main(config: ControlLoopConfig):
+ 
+                 # Start or Stop data collection
+                 if wbc_goal.get("toggle_data_collection", False):
+-                    dispatcher.handle_key("c")
++                    _dispatch_key(dispatcher, "c")
+ 
+                 # Abort the current episode
+                 if wbc_goal.get("toggle_data_abort", False):
+-                    dispatcher.handle_key("x")
++                    _dispatch_key(dispatcher, "x")
++
++                # PICO A+B+X+Y (patch_reset.py): lower-body policy ON, idempotent (never a toggle). Called on the
++                # policy directly: the real robot's ROSKeyboardDispatcher has no handle_key, so a dispatched ']' was
++                # silently ignored (2026-11-18 19:03, real run).
++                if wbc_goal.get("dwbc_policy_on", False) and not getattr(
++                        wbc_policy.lower_body_policy, "use_policy_action", False):
++                    wbc_policy.handle_keyboard_button("]")
+ 
+                 if env.use_sim and wbc_goal.get("reset_env_and_policy", False):
+                     print("Resetting sim environment and policy")
+                     # Reset teleop policy & sim env
+-                    dispatcher.handle_key("k")
++                    _dispatch_key(dispatcher, "k")
+ 
+                     # Clear upper body commands
+                     upper_body_policy_subscriber._msg = None
+diff --git a/decoupled_wbc/control/teleop/streamers/pico_streamer.py b/decoupled_wbc/control/teleop/streamers/pico_streamer.py
+index 315e762..2385156 100644
+--- a/decoupled_wbc/control/teleop/streamers/pico_streamer.py
++++ b/decoupled_wbc/control/teleop/streamers/pico_streamer.py
+@@ -44,6 +44,16 @@ class PicoStreamer(BaseStreamer):
+         self.toggle_activation_last = False
+         self.toggle_data_collection_last = False
+         self.toggle_data_abort_last = False
++        self._abxy_last = False
++        # presses since the teleop process started; kept across reset_status() so a later reset can never turn
++        # the next A+B+X+Y into a toggle (that would switch the leg policy OFF)
++        self._abxy_count = getattr(self, "_abxy_count", 0)
++        self._height_ramp = False      # base height ramping back to standing
++        self._height_ramp_t = None
++        self._ax_since = None
++        self._ax_on = False
++        self._height_key = None
++        self._height_since = 0.0
+ 
+     def start_streaming(self):
+         pass
+@@ -125,10 +135,27 @@ class PicoStreamer(BaseStreamer):
+ 
+         # Get base height command
+         height_increment = 0.01  # Small step per call when button is pressed
+-        if pico_data["Y"]:
++        # X / Y alone (no A / B, not both) and held >= 0.3 s: ABXY (leg policy toggle) never moves the height
++        _a, _b, _x, _y = (bool(pico_data[k]) for k in ("A", "B", "X", "Y"))
++        _solo = "Y" if (_y and not (_x or _a or _b)) else ("X" if (_x and not (_y or _a or _b)) else None)
++        _now = time.monotonic()
++        if _solo != self._height_key:
++            self._height_key, self._height_since = _solo, _now
++        if _solo == "Y" and _now - self._height_since >= 0.3:
+             self.current_base_height += height_increment
+-        elif pico_data["X"]:
++        elif _solo == "X" and _now - self._height_since >= 0.3:
+             self.current_base_height -= height_increment
++        # A+B+X+Y (after the first press) ramps the height back to standing, slowly; X / Y alone cancels it
++        RESET_HEIGHT_M_S = 0.05
++        if _solo is not None:
++            self._height_ramp = False
++        if self._height_ramp:
++            dt_h = 0.0 if self._height_ramp_t is None else min(0.2, _now - self._height_ramp_t)
++            step = RESET_HEIGHT_M_S * dt_h
++            self.current_base_height += float(np.clip(0.74 - self.current_base_height, -step, step))
++            if abs(0.74 - self.current_base_height) < 1e-4:
++                self._height_ramp = False
++        self._height_ramp_t = _now
+         self.current_base_height = np.clip(self.current_base_height, 0.2, 0.74)
+ 
+         # Get gripper commands
+@@ -136,10 +163,34 @@ class PicoStreamer(BaseStreamer):
+         right_fingers = self._generate_finger_data(pico_data, "right")
+ 
+         # Get activation commands
++        _abxy = _a and _b and _x and _y
++        _abxy_edge = _abxy and not self._abxy_last
++        self._abxy_last = _abxy
++        reset_to_stand = False
++        dwbc_policy_on = False
++        if _abxy_edge:
++            # every press: leg policy ON (idempotent, never a toggle - the PICO must never stop the policy) and a slow
++            # return to the default balanced standing state (height here, arms + waist in dwbc_teleop_ext.py)
++            self._abxy_count += 1
++            dwbc_policy_on = True
++            reset_to_stand = True
++            self._height_ramp = True
++            print(f"[dwbc] PICO A+B+X+Y (#{self._abxy_count}) -> leg policy ON + slow return to default standing",
++                  flush=True)
+         toggle_policy_action_tmp = pico_data["left_menu_button"] and (
+             pico_data["left_trigger"] > 0.5
+         )
+-        toggle_activation_tmp = pico_data["left_menu_button"] and (pico_data["right_trigger"] > 0.5)
++        # A+X alone (no B / Y) held >= 0.3 s -> arm following toggle (once per press)
++        _ax = _a and _x and not (_b or _y)
++        if _ax:
++            if self._ax_since is None:
++                self._ax_since = _now
++            if not self._ax_on and _now - self._ax_since >= 0.3:
++                self._ax_on = True
++                print("[dwbc] PICO A+X -> arm following toggle", flush=True)
++        else:
++            self._ax_since, self._ax_on = None, False
++        toggle_activation_tmp = self._ax_on or (pico_data["left_menu_button"] and (pico_data["right_trigger"] > 0.5))
+ 
+         if self.toggle_policy_action_last != toggle_policy_action_tmp:
+             toggle_policy_action = toggle_policy_action_tmp
+@@ -182,6 +233,8 @@ class PicoStreamer(BaseStreamer):
+                 "base_height_command": self.current_base_height,
+                 "navigate_cmd": [lin_vel_x, lin_vel_y, ang_vel_z],
+                 "toggle_policy_action": toggle_policy_action,
++                "reset_to_stand": reset_to_stand,
++                "dwbc_policy_on": dwbc_policy_on,
+             },
+             teleop_data={
+                 "toggle_activation": toggle_activation,
+diff --git a/gear_sonic/scripts/pico_manager_thread_server.py b/gear_sonic/scripts/pico_manager_thread_server.py
+index 3983530..f786ceb 100644
+--- a/gear_sonic/scripts/pico_manager_thread_server.py
++++ b/gear_sonic/scripts/pico_manager_thread_server.py
+@@ -1897,6 +1897,112 @@ class PlannerStreamer:
+         self.last_send = time.time()
+ 
+ 
++class ChordDetector:
++    """PICO face-button chords (2026-11-16). A+B+X+Y fires on the rising edge of all four. A+X (or B+Y) fires only
++    after it has been held ALONE (no B/Y, resp. no A/X) for `settle` s, so the A and X that usually land first while
++    pressing A+B+X+Y never count as an A+X. After A+B+X+Y nothing else fires until all four buttons are released
++    (a sloppy release that keeps A+X held cannot start following)."""
++
++    def __init__(self, settle: float = 0.3):
++        self.settle = settle
++        self.prev_all = False
++        self.prev_ax = False
++        self.prev_by = False
++        self.ax_t0 = None
++        self.by_t0 = None
++        self.locked = False
++
++    def update(self, a: bool, b: bool, x: bool, y: bool, now: float):
++        all4 = bool(a and b and x and y)
++        start_edge = all4 and not self.prev_all
++        if all4:
++            self.locked = True
++        elif not (a or b or x or y):
++            self.locked = False
++        ax = bool(a and x and not (b or y)) and not self.locked
++        by = bool(b and y and not (a or x)) and not self.locked
++        ax_edge = by_edge = False
++        if ax and not self.prev_ax:
++            self.ax_t0 = now
++        if not ax:
++            self.ax_t0 = None
++        if self.ax_t0 is not None and now - self.ax_t0 >= self.settle:
++            ax_edge, self.ax_t0 = True, None            # once per press
++        if by and not self.prev_by:
++            self.by_t0 = now
++        if not by:
++            self.by_t0 = None
++        if self.by_t0 is not None and now - self.by_t0 >= self.settle:
++            by_edge, self.by_t0 = True, None
++        self.prev_all, self.prev_ax, self.prev_by = all4, ax, by
++        return start_edge, ax_edge, by_edge
++
++
++def next_stream_mode(current, start_edge, ax_edge, by_edge, axis_click_edge, menu_held, pause_source, vr3pt_parent):
++    """PICO mode state machine (2026-11-16, operator request). Returns (new_mode, pause_source, note).
++
++      OFF        --A+B+X+Y--> PLANNER       start the policy (robot stands in place)
++      PLANNER    --A+X------> POSE          whole-body follow
++                 --A+B+X+Y--> (nothing)     the PICO never stops the policy: damping / stop only from the
++                                            workstation (app e-stop, real_teleop.sh estop), so a mistaken press can
++                                            never drop the robot
++      POSE       --A+X------> POSE_PAUSE    hold the last frame (body, arms, hands: the deploy clamps to it)
++                 --A+B+X+Y--> PLANNER       back to standing in place
++      POSE_PAUSE --A+X------> POSE          resume (yaw re-anchored; the robot moves to the operator's CURRENT pose,
++                                            so put the arms back near the paused pose first)
++                 --A+B+X+Y--> PLANNER       back to standing in place
++    Unchanged sub-modes: POSE <-B+Y-> PLANNER_FROZEN_UPPER_BODY <-left axis click-> PLANNER_VR_3PT,
++    PLANNER <-left axis click-> PLANNER_VR_3PT; holding the left menu button in POSE pauses until it is released
++    (pause_source "menu"; an A+X pause is only ended by A+X or A+B+X+Y). A+B+X+Y in FROZEN / VR_3PT -> PLANNER.
++    OFF is never re-entered from the PICO.
++    """
++    S = StreamMode
++    new, note = current, None
++    if current == S.OFF:
++        if start_edge:
++            new = S.PLANNER
++    elif current == S.PLANNER:
++        if start_edge:
++            note = "A+B+X+Y in PLANNER: ignored (the PICO never stops the policy; stop it from the workstation)"
++        elif ax_edge:
++            new = S.POSE
++        elif axis_click_edge:
++            new = S.PLANNER_VR_3PT
++    elif current == S.POSE:
++        if start_edge:
++            new = S.PLANNER
++        elif ax_edge:
++            new, pause_source = S.POSE_PAUSE, "ax"
++        elif by_edge:
++            new = S.PLANNER_FROZEN_UPPER_BODY
++        elif menu_held:
++            new, pause_source = S.POSE_PAUSE, "menu"
++    elif current == S.POSE_PAUSE:
++        if start_edge:
++            new = S.PLANNER
++        elif ax_edge:
++            new = S.POSE
++        elif pause_source == "menu" and not menu_held:
++            new = S.POSE
++    elif current == S.PLANNER_FROZEN_UPPER_BODY:
++        if start_edge:
++            new = S.PLANNER
++        elif by_edge:
++            new = S.POSE
++        elif axis_click_edge:
++            new = S.PLANNER_VR_3PT
++    elif current == S.PLANNER_VR_3PT:
++        if start_edge:
++            new = S.PLANNER
++        elif axis_click_edge:
++            new = vr3pt_parent
++        elif ax_edge or by_edge:
++            new = S.POSE
++    if new != S.POSE_PAUSE:
++        pause_source = None
++    return new, pause_source, note
++
++
+ def run_pico_manager(
+     port: int = 5556,
+     buffer_size: int = 15,
+@@ -1915,9 +2021,9 @@ def run_pico_manager(
+ ):
+     """
+     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
+-    Controller input:
+-      A+X: Toggle between planner and pose mode
+-      A+B+X+Y: Toggle policy start/stop
++    Controller input (2026-11-16, see next_stream_mode / ChordDetector):
++      A+B+X+Y: start the policy (OFF -> PLANNER); later it only returns to PLANNER (standing), never stops
++      A+X: PLANNER -> POSE (follow) -> POSE_PAUSE (hold the last frame) -> POSE ...
+     """
+     reader = _init_input_source(input_source, buffer_size)
+ 
+@@ -1975,10 +2081,15 @@ def run_pico_manager(
+     #                                                        |
+     #                                                   (ax)--> POSE
+     #
+-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
+-    #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
++    #   2026-11-16 (operator request; next_stream_mode has the full table):
++    #     OFF --(A+B+X+Y)--> PLANNER --(A+X)--> POSE --(A+X)--> POSE_PAUSE --(A+X)--> POSE ...
++    #     A+B+X+Y in POSE / POSE_PAUSE / FROZEN / VR_3PT --> PLANNER (standing); in PLANNER it is ignored.
++    #     There is NO e-stop on the PICO any more: OFF (policy stop -> damping) is never re-entered from here;
++    #     stop from the workstation (app e-stop / real_teleop.sh estop), the Unitree remote or the physical e-stop.
++    #   POSE_PAUSE: also left_menu_button held --> POSE_PAUSE, released --> POSE (only for a menu pause)
+     #
+-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
++    print("Manager controls: A+B+X+Y=start policy / back to standing (never stops it), "
++          "A+X=follow / pause / resume (hold A+X 0.3 s); stop the policy only from the workstation")
+     current_mode = StreamMode.OFF
+     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
+     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
+@@ -1986,11 +2097,12 @@ def run_pico_manager(
+     prev_toggle_dc = False
+     prev_toggle_da = False
+     try:
+-        prev_ax_pressed = False
+-        prev_by_pressed = False
+-        prev_start_combo = False
+         prev_left_axis_click = False
++        chords = ChordDetector(settle=0.3)
++        pause_source = None
+         while True:
++            # 500 Hz is plenty for buttons; an unthrottled loop holds the GIL and starves the pose thread
++            time.sleep(0.002)
+             # Poll Pico controller for buttons/axes
+             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
+ 
+@@ -1998,74 +2110,25 @@ def run_pico_manager(
+ 
+             left_axis_click, _ = get_axis_clicks(reader)
+ 
+-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
+-            ax_pressed = (a_pressed) and (x_pressed)
+-
+-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
+-            by_pressed = (b_pressed) and (y_pressed)
+-
+-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+-            start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+-
+-            new_mode = current_mode
+-            if current_mode == StreamMode.OFF:
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.PLANNER
+-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
+-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
+-                    sample = reader.get_latest()
+-                    if sample is not None:
+-                        three_point.calibrate_now(sample["body_poses_np"])
+-                    else:
+-                        print("[Manager] WARNING: No SMPL data available for calibration")
+-
+-            elif current_mode == StreamMode.PLANNER:
+-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.OFF
+-                elif ax_pressed and not prev_ax_pressed:
+-                    new_mode = StreamMode.POSE
+-                elif left_axis_click and not prev_left_axis_click:
+-                    new_mode = StreamMode.PLANNER_VR_3PT
+-
+-            elif current_mode == StreamMode.POSE:
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.OFF
+-                elif ax_pressed and not prev_ax_pressed:
+-                    new_mode = StreamMode.PLANNER  # Enter chain 2
+-                elif by_pressed and not prev_by_pressed:
+-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
+-                elif left_menu_button:
+-                    new_mode = StreamMode.POSE_PAUSE
+-
+-            elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+-                # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.OFF
+-                elif by_pressed and not prev_by_pressed:
+-                    new_mode = StreamMode.POSE
+-                elif left_axis_click and not prev_left_axis_click:
+-                    new_mode = StreamMode.PLANNER_VR_3PT
+-
+-            elif current_mode == StreamMode.POSE_PAUSE:
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.OFF
+-                elif not left_menu_button:
+-                    new_mode = StreamMode.POSE
+-
+-            elif current_mode == StreamMode.PLANNER_VR_3PT:
+-                # VR_3PT is reachable from both chains:
+-                #   left_axis_click → return to parent (PLANNER or FROZEN)
+-                #   ax_pressed      → POSE (chain 2 exit)
+-                #   by_pressed      → POSE (chain 1 exit)
+-                if start_combo and not prev_start_combo:
+-                    new_mode = StreamMode.OFF
+-                elif left_axis_click and not prev_left_axis_click:
+-                    new_mode = vr3pt_parent_mode  # Return to parent mode
+-                elif ax_pressed and not prev_ax_pressed:
+-                    new_mode = StreamMode.POSE
+-                elif by_pressed and not prev_by_pressed:
+-                    new_mode = StreamMode.POSE
++            # 2026-11-16: chord detection with settle time + lockout, and the new mode chain (next_stream_mode)
++            start_combo, ax_edge, by_edge = chords.update(a_pressed, b_pressed, x_pressed, y_pressed, time.time())
++            axis_click_edge = bool(left_axis_click) and not prev_left_axis_click
++            new_mode, pause_source, note = next_stream_mode(
++                current_mode, start_combo, ax_edge, by_edge, axis_click_edge, bool(left_menu_button),
++                pause_source, vr3pt_parent_mode)
++            if note:
++                print(f"[Manager] {note}")
++            if current_mode == StreamMode.OFF and new_mode == StreamMode.PLANNER:
++                # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
++                # Uses the current Pico SMPL frame + FK of all-zero body joints.
++                sample = reader.get_latest()
++                if sample is not None:
++                    three_point.calibrate_now(sample["body_poses_np"])
++                else:
++                    print("[Manager] WARNING: No SMPL data available for calibration")
++            if new_mode == StreamMode.POSE_PAUSE and current_mode != StreamMode.POSE_PAUSE:
++                print(f"[Manager] PAUSED ({pause_source}): the robot holds the last frame; "
++                      f"A+X resumes, A+B+X+Y returns to standing")
+ 
+             # Handle mode transitions before running loop
+             if new_mode != current_mode:
+@@ -2141,9 +2204,6 @@ def run_pico_manager(
+                 )
+             )
+ 
+-            prev_ax_pressed = ax_pressed
+-            prev_by_pressed = by_pressed
+-            prev_start_combo = start_combo
+             prev_left_axis_click = left_axis_click
+ 
+     except KeyboardInterrupt:
+diff --git a/gear_sonic_deploy/policy/low_latency/observation_config.yaml b/gear_sonic_deploy/policy/low_latency/observation_config.yaml
+new file mode 100644
+index 0000000..d95ff3b
+--- /dev/null
++++ b/gear_sonic_deploy/policy/low_latency/observation_config.yaml
+@@ -0,0 +1,92 @@
++# SONIC Release (Low-Latency) - Observation Configuration
++# =======================================================
++# For ONNX models exported from the low-latency sonic_release checkpoint
++# (smpl 4-frame lookahead; g1/teleop lookahead at step1, body-frame orientation).
++#
++# Encoder input dimension: 1247   Decoder/policy dimension: 994   token: 64
++# Uses the unitoken_all_noz tokenizer config (3 encoders: g1, teleop, smpl)
++#
++# Requires the smpl_*_4frame_step1 entries in GetObservationRegistry()
++# (src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp) + a rebuild to load.
++
++observations:
++
++  - name: "token_state"
++    enabled: true
++
++  - name: "his_base_angular_velocity_10frame_step1"
++    enabled: true
++
++  - name: "his_body_joint_positions_10frame_step1"
++    enabled: true
++
++  - name: "his_body_joint_velocities_10frame_step1"
++    enabled: true
++
++  - name: "his_last_actions_10frame_step1"
++    enabled: true
++
++  - name: "his_gravity_dir_10frame_step1"
++    enabled: true
++
++encoder:
++  dimension: 64
++  use_fp16: false
++  encoder_observations:
++    # Shared
++    - name: "encoder_mode_4"
++      enabled: true
++    # g1 encoder: command_multi_future_nonflat (positions + velocities), step1
++    - name: "motion_joint_positions_10frame_step1"
++      enabled: true
++    - name: "motion_joint_velocities_10frame_step1"
++      enabled: true
++    # g1 encoder: motion_anchor_ori_b_mf_nonflat (body, multi-frame FIRST), step1
++    - name: "motion_anchor_orientation_10frame_step1"
++      enabled: true
++    # teleop encoder: motion_anchor_ori_b (body, single-frame SECOND)
++    - name: "motion_anchor_orientation"
++      enabled: true
++    # teleop encoder: command_multi_future_lower_body, step1
++    - name: "motion_joint_positions_lowerbody_10frame_step1"
++      enabled: true
++    - name: "motion_joint_velocities_lowerbody_10frame_step1"
++      enabled: true
++    # teleop encoder: vr_3point
++    - name: "vr_3point_local_target"
++      enabled: true
++    - name: "vr_3point_local_orn_target"
++      enabled: true
++    # smpl encoder: smpl_joints_multi_future_local_nonflat (4 frames, step1)  <-- LOW-LATENCY
++    - name: "smpl_joints_4frame_step1"
++      enabled: true
++    # smpl encoder: smpl_root_ori_b_multi_future (body, 4 frames, step1)      <-- LOW-LATENCY
++    - name: "smpl_anchor_orientation_4frame_step1"
++      enabled: true
++    # smpl encoder: joint_pos_multi_future_wrist_for_smpl (4 frames, step1)   <-- LOW-LATENCY
++    - name: "motion_joint_positions_wrists_4frame_step1"
++      enabled: true
++  encoder_modes:
++    - name: "g1"
++      mode_id: 0
++      required_observations:
++        - encoder_mode_4
++        - motion_joint_positions_10frame_step1
++        - motion_joint_velocities_10frame_step1
++        - motion_anchor_orientation_10frame_step1
++    - name: "teleop"
++      mode_id: 1
++      required_observations:
++        - encoder_mode_4
++        - motion_joint_positions_lowerbody_10frame_step1
++        - motion_joint_velocities_lowerbody_10frame_step1
++        - vr_3point_local_target
++        - vr_3point_local_orn_target
++        - motion_anchor_orientation
++    - name: "smpl"
++      mode_id: 2
++      required_observations:
++        - encoder_mode_4
++        - smpl_joints_4frame_step1
++        - smpl_anchor_orientation_4frame_step1
++        - motion_joint_positions_wrists_4frame_step1
+-- 
+2.34.1
+

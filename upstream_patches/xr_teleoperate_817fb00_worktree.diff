@@ -1,0 +1,456 @@
+diff --git a/teleop/robot_control/robot_arm.py b/teleop/robot_control/robot_arm.py
+index 8530375..29db11c 100644
+--- a/teleop/robot_control/robot_arm.py
++++ b/teleop/robot_control/robot_arm.py
+@@ -1,3 +1,4 @@
++import os
+ import numpy as np
+ import threading
+ import time
+@@ -90,6 +91,14 @@ class G1_29_ArmController:
+         self.kp_wrist = 40.0
+         self.kd_wrist = 1.5
+ 
++        # [local patch] optional left wrist yaw (motor 21) zero offset: removed on read, added on command, with the
++        # true angle capped at XR_LEFT_WRIST_YAW_MAX. The zero was re-calibrated on the robot 2026-10-30, so the
++        # defaults are offset 0 and the URDF limit 1.614 (no compensation). Old values were 1.58 / 0.25.
++        self.left_wrist_yaw_offset = float(os.getenv("XR_LEFT_WRIST_YAW_OFFSET", "0"))
++        self.left_wrist_yaw_max = float(os.getenv("XR_LEFT_WRIST_YAW_MAX", "1.614"))
++        self.kLeftWristYawArmIdx = list(G1_29_JointArmIndex).index(G1_29_JointArmIndex.kLeftWristyaw)
++        self.released = False  # [local patch] True after go_home handed the arms back to the locomotion controller
++
+         self.all_motor_q = None
+         self.set_arm_velocity_limit()
+         self.control_dt = 1.0 / 250.0
+@@ -123,6 +132,20 @@ class G1_29_ArmController:
+         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
+         logger_mp.info("Lock all joints except two arms...")
+ 
++        # [local patch] hold current arm pose until teleop starts (upstream targets zeros -> arms snap at init),
++        # and cap arm speed; override with env XR_ARM_VEL_LIMIT (rad/s, upstream default 30).
++        self.q_target = self._clamp_left_wrist_yaw(self.get_current_dual_arm_q())
++        # [local patch 2026-10-31] rate-limit the *command* (not measured q + step, which left the PD term at ~0 Nm and
++        # let the gravity ff alone drive the arm), cap how far the command may lead the measured q (bounds the push on
++        # contact), and compute the gravity ff at the measured q every cycle (gravity_fn, set by the caller).
++        self.last_cmd_q = self.q_target.copy()
++        self.max_lead = float(os.getenv("XR_MAX_LEAD", "0.15"))
++        self.engage_t = 0.0   # soft start: speed limit ramps 0.5 rad/s -> limit over 2 s after engage()
++        self.gravity_fn = None
++        self.set_arm_velocity_limit(float(os.getenv("XR_ARM_VEL_LIMIT", "3.0")))
++        logger_mp.info(f"[local patch] hold current arm pose, arm velocity limit {self.arm_velocity_limit} rad/s, "
++                       f"left wrist yaw offset {self.left_wrist_yaw_offset} rad (true max {self.left_wrist_yaw_max})")
++
+         arm_indices = set(member.value for member in G1_29_JointArmIndex)
+         for id in G1_29_JointIndex:
+             self.msg.motor_cmd[id].mode = 1
+@@ -165,10 +188,16 @@ class G1_29_ArmController:
+             time.sleep(0.002)
+ 
+     def clip_arm_q_target(self, target_q, velocity_limit):
++        # [local patch] step from the previous command, then keep it within max_lead of the measured q
+         current_q = self.get_current_dual_arm_q()
+-        delta = target_q - current_q
++        ramp = (time.time() - self.engage_t) / 2.0
++        if ramp < 1.0:
++            velocity_limit = min(velocity_limit, 0.5 + (velocity_limit - 0.5) * max(ramp, 0.0))
++        delta = target_q - self.last_cmd_q
+         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
+-        cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
++        cliped_arm_q_target = self.last_cmd_q + delta / max(motion_scale, 1.0)
++        cliped_arm_q_target = np.clip(cliped_arm_q_target, current_q - self.max_lead, current_q + self.max_lead)
++        self.last_cmd_q = cliped_arm_q_target
+         return cliped_arm_q_target
+ 
+     def _ctrl_motor_state(self):
+@@ -187,10 +216,14 @@ class G1_29_ArmController:
+             else:
+                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+ 
++            if self.gravity_fn is not None:   # [local patch] gravity ff at the measured pose
++                arm_tauff_target = self.gravity_fn(self.get_current_dual_arm_q())
+             for idx, id in enumerate(G1_29_JointArmIndex):
+                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
+                 self.msg.motor_cmd[id].dq = 0
+-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
++                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
++            # [local patch] true angle -> raw encoder frame for the left wrist yaw
++            self.msg.motor_cmd[G1_29_JointArmIndex.kLeftWristyaw].q += self.left_wrist_yaw_offset
+ 
+             self.msg.crc = self.crc.Crc(self.msg)
+             self.lowcmd_publisher.Write(self.msg)
+@@ -202,8 +235,14 @@ class G1_29_ArmController:
+             # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
+             # logger_mp.debug(f"sleep_time:{sleep_time}")
+ 
++    def _clamp_left_wrist_yaw(self, q):
++        q = np.array(q, dtype=float)
++        q[self.kLeftWristYawArmIdx] = min(q[self.kLeftWristYawArmIdx], self.left_wrist_yaw_max)
++        return q
++
+     def ctrl_dual_arm(self, q_target, tauff_target):
+         '''Set control target values q & tau of the left and right arm motors.'''
++        q_target = self._clamp_left_wrist_yaw(q_target)
+         with self.ctrl_lock:
+             self.q_target = q_target
+             self.tauff_target = tauff_target
+@@ -220,32 +259,71 @@ class G1_29_ArmController:
+     
+     def get_current_dual_arm_q(self):
+         '''Return current state q of the left and right arm motors.'''
+-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointArmIndex])
+-    
++        q = np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointArmIndex])
++        q[self.kLeftWristYawArmIdx] -= self.left_wrist_yaw_offset  # [local patch] raw -> true angle
++        return q
++
+     def get_current_dual_arm_dq(self):
+         '''Return current state dq of the left and right arm motors.'''
+         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
+-    
++
+     def ctrl_dual_arm_go_home(self):
+-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
++        '''Move both arms to the home pose, then (motion mode) hand them back to the locomotion controller.'''
++        # [local patch] upstream homed to all zeros and, if not within 0.05 rad after 5 s, exited without releasing
++        # arm_sdk, leaving the arms frozen wherever they were (seen 2026-10-31). Now: home to the 501 default arm
++        # pose, wait up to 10 s, and always ramp the arm_sdk weight to 0 in motion mode.
++        if self.released:
++            return
+         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
+-        max_attempts = 100
+-        current_attempts = 0
++        home = np.array([0.29, 0.22, 0.0, 0.98, 0.09, 0.0, 0.0,  0.29, -0.22, 0.0, 0.97, -0.09, 0.0, 0.0])
++        # The per-cycle clip (target = current q + v*dt) gives only ~1 Nm of PD push, too little to move a raised arm
++        # against gravity, so instead stream a min-jerk path (peak 0.5 rad/s) with the clip opened up.
++        q0 = self.get_current_dual_arm_q()
++        self.last_cmd_q = q0.copy()
+         with self.ctrl_lock:
+-            self.q_target = np.zeros(14)
+-            # self.tauff_target = np.zeros(14)
+-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
+-        while current_attempts < max_attempts:
+-            current_q = self.get_current_dual_arm_q()
+-            if np.all(np.abs(current_q) < tolerance):
+-                if self.motion_mode:
+-                    for weight in np.linspace(1, 0, num=101):
+-                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
+-                        time.sleep(0.02)
++            self.tauff_target = np.zeros(14)  # the last IK gravity ff belongs to the teleop pose, not the path
++        T = max(2.0, 1.875 * np.max(np.abs(home - q0)) / 0.5)
++        saved_limit = self.arm_velocity_limit
++        self.arm_velocity_limit = 30.0
++        t0 = time.time()
++        while True:
++            s = min((time.time() - t0) / T, 1.0)
++            with self.ctrl_lock:
++                self.q_target = q0 + (home - q0) * (10 * s**3 - 15 * s**4 + 6 * s**5)
++            if s >= 1.0:
++                break
++            time.sleep(0.01)
++        self.arm_velocity_limit = saved_limit
++        tolerance = 0.1
++        t_end = time.time() + 3.0
++        while time.time() < t_end:
++            err = np.max(np.abs(self.get_current_dual_arm_q() - home))
++            if err < tolerance:
+                 logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
+                 break
+-            current_attempts += 1
+             time.sleep(0.05)
++        else:
++            logger_mp.warning(f"[G1_29_ArmController] home not reached 3 s after the path (max err {err:.2f} rad); releasing anyway")
++        if self.motion_mode:
++            for weight in np.linspace(1, 0, num=151):
++                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
++                time.sleep(0.02)
++            logger_mp.info("[G1_29_ArmController] arm_sdk released to the locomotion controller.")
++            self.released = True
++
++    def engage(self):
++        '''[local patch] Take the arms back after go_home released them: hold the measured pose, ramp weight 0 -> 1.'''
++        with self.ctrl_lock:
++            self.q_target = self._clamp_left_wrist_yaw(self.get_current_dual_arm_q())
++            self.tauff_target = np.zeros(14)
++            self.last_cmd_q = self.q_target.copy()
++        self.engage_t = time.time()
++        if self.motion_mode and self.released:
++            for weight in np.linspace(0, 1, num=51):
++                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
++                time.sleep(0.02)
++        self.released = False
++        logger_mp.info("[G1_29_ArmController] arms engaged (holding current pose).")
+ 
+     def set_arm_velocity_limit(self, velocity_limit = 30.0):
+         '''Set the arm joint velocity limit in radians per second.'''
+diff --git a/teleop/robot_control/robot_hand_unitree.py b/teleop/robot_control/robot_hand_unitree.py
+index ab8d61f..12b61ef 100644
+--- a/teleop/robot_control/robot_hand_unitree.py
++++ b/teleop/robot_control/robot_hand_unitree.py
+@@ -262,8 +262,10 @@ class Dex1_1_Gripper_Controller:
+         self.fps = fps
+         self.Unit_Test = Unit_Test
+         self.gripper_sub_ready = False
++        self.left_present = False
++        self.right_present = False
+         self.simulation_mode = simulation_mode
+-        
++
+         if filter and not self.simulation_mode:
+             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
+         else:
+@@ -275,24 +277,29 @@ class Dex1_1_Gripper_Controller:
+         self.RightGripperCmb_publisher = ChannelPublisher(kTopicGripperRightCommand, MotorCmds_)
+         self.RightGripperCmb_publisher.Init()
+ 
+-        self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
+-        self.LeftGripperState_subscriber.Init()
+-        self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
+-        self.RightGripperState_subscriber.Init()
+-
+         # Shared Arrays for gripper states
+         self.left_gripper_state_value = Value('d', 0.0, lock=True)
+         self.right_gripper_state_value = Value('d', 0.0, lock=True)
+ 
+-        # initialize subscribe thread
+-        self.subscribe_state_thread = threading.Thread(target=self._subscribe_gripper_state)
+-        self.subscribe_state_thread.daemon = True
+-        self.subscribe_state_thread.start()
++        # [local patch] callback subscribers per side: upstream polled both with a blocking Read(),
++        # so a missing gripper starved the other one
++        self.LeftGripperState_subscriber = ChannelSubscriber(kTopicGripperLeftState, MotorStates_)
++        self.LeftGripperState_subscriber.Init(self._on_left_gripper_state, 10)
++        self.RightGripperState_subscriber = ChannelSubscriber(kTopicGripperRightState, MotorStates_)
++        self.RightGripperState_subscriber.Init(self._on_right_gripper_state, 10)
+ 
+-        while not self.gripper_sub_ready:
++        # [local patch] allow a single gripper: wait up to 3 s for both sides, then run with whichever
++        # side reports state (upstream waited forever for both). Fail if none within 10 s.
++        logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
++        t0 = time.time()
++        while not (self.left_present and self.right_present) and time.time() - t0 < 3.0:
++            time.sleep(0.01)
++        while not (self.left_present or self.right_present):
++            if time.time() - t0 > 10.0:
++                raise TimeoutError("[Dex1_1_Gripper_Controller] no rt/dex1/*/state received within 10 s")
+             time.sleep(0.01)
+-            logger_mp.warning("[Dex1_1_Gripper_Controller] Waiting to subscribe dds...")
+-        logger_mp.info("[Dex1_1_Gripper_Controller] Subscribe dds ok.")
++        self.gripper_sub_ready = True
++        logger_mp.info(f"[Dex1_1_Gripper_Controller] Subscribe dds ok. left={self.left_present} right={self.right_present}")
+ 
+         self.gripper_control_thread = threading.Thread(target=self.control_thread, args=(left_gripper_value_in, right_gripper_value_in, self.left_gripper_state_value, self.right_gripper_state_value,
+                                                                                          dual_gripper_data_lock, dual_gripper_state_out, dual_gripper_action_out, xr_motion_data_ready_in))
+@@ -301,23 +308,24 @@ class Dex1_1_Gripper_Controller:
+ 
+         logger_mp.info("Initialize Dex1_1_Gripper_Controller OK!")
+ 
+-    def _subscribe_gripper_state(self):
+-        while True:
+-            left_gripper_msg  = self.LeftGripperState_subscriber.Read()
+-            right_gripper_msg  = self.RightGripperState_subscriber.Read()
+-            if left_gripper_msg is not None and right_gripper_msg is not None:
+-                self.left_gripper_state_value.value = left_gripper_msg.states[0].q
+-                self.right_gripper_state_value.value = right_gripper_msg.states[0].q
+-                self.gripper_sub_ready = True
+-            time.sleep(0.002)
++    def _on_left_gripper_state(self, msg):
++        self.left_gripper_state_value.value = msg.states[0].q
++        self.left_present = True
++
++    def _on_right_gripper_state(self, msg):
++        self.right_gripper_state_value.value = msg.states[0].q
++        self.right_present = True
+     
+     def ctrl_dual_gripper(self, dual_gripper_action):
+         """set current left, right gripper motor cmd target q"""
+         self.left_gripper_msg.cmds[0].q  = dual_gripper_action[0]
+         self.right_gripper_msg.cmds[0].q = dual_gripper_action[1]
+ 
+-        self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
+-        self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
++        # [local patch] only command grippers that report state
++        if self.left_present:
++            self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
++        if self.right_present:
++            self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
+         # logger_mp.debug("gripper ctrl publish ok.")
+     
+     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
+diff --git a/teleop/teleop_hand_and_arm.py b/teleop/teleop_hand_and_arm.py
+index b33ac81..e31a4f4 100644
+--- a/teleop/teleop_hand_and_arm.py
++++ b/teleop/teleop_hand_and_arm.py
+@@ -1,4 +1,6 @@
+ import time
++import numpy as np
++import pinocchio as pin
+ import argparse
+ from multiprocessing import Value, Array, Lock
+ import threading
+@@ -32,6 +34,29 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
+ 
+ # state transition
+ START          = False  # Enable to start robot following VR user motion
++TRACKING       = True
++ARM_SCALE, ARM_REACH, SH_L, SH_R = 1.0, 9.0, np.zeros(3), np.zeros(3)
++def scale_wrist(T, sh):
++    """[local patch] scale a wrist target about the robot shoulder and cap it at ARM_REACH."""
++    T = np.array(T, dtype=float).copy(); v = (T[:3, 3] - sh) * ARM_SCALE; n = np.linalg.norm(v)
++    if n > ARM_REACH: v *= ARM_REACH / n
++    T[:3, 3] = sh + v
++    return T
++def ik_reset(arm_ik, q):
++    """[local patch] warm-start the IK from q and drop the smoothing history (on start / resume)."""
++    arm_ik.init_data = np.array(q, dtype=float).copy()
++    arm_ik.smooth_filter._data_queue.clear()   # [local patch] False while paused by the right A button (arms homed, X resumes)
++# [local patch] XR_TRACE_DIR=<dir>: per-loop trace (XR poses, buttons, IK target, measured arm q) in 30 s npz chunks
++TRACE_DIR      = os.getenv("XR_TRACE_DIR", "")
++_trace, _trace_t0, _trace_k = [], time.time(), 0
++def trace_flush(force=False):
++    global _trace, _trace_t0, _trace_k
++    if not TRACE_DIR or not _trace or (not force and time.time() - _trace_t0 < 30.0):
++        return
++    _trace_k += 1
++    np.save(os.path.join(TRACE_DIR, f"trace_{_trace_k:04d}.npy"), np.array(_trace, dtype=float))
++    _trace, _trace_t0 = [], time.time()
++NO_LOCO        = os.getenv("XR_NO_LOCO", "0") == "1"  # [local patch] leave walking to the Unitree remote
+ STOP           = False  # Enable to begin system exit procedure
+ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
+ RECORD_RUNNING = False  # True if [Recording]
+@@ -166,6 +191,19 @@ if __name__ == '__main__':
+                                                               dual_gripper_action_array, motion_mode=args.motion, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+             else:
+                 arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
++            # [local patch 2026-10-31] gravity ff at the measured pose (own pin.Data: runs in the publish thread),
++            # and workspace scaling of the XR wrist targets about the robot shoulders (robot reach is ~0.46 m;
++            # unscaled operator targets were 0.53 m p50 / 0.74 m p90 away, so 78% of frames were unreachable).
++            _gm = arm_ik.reduced_robot.model; _gd = _gm.createData(); _sd = _gm.createData()
++            GFF = float(os.getenv("XR_GFF", "1.0"))
++            arm_ctrl.gravity_fn = lambda q: GFF * pin.rnea(_gm, _gd, q, np.zeros(14), np.zeros(14))
++            pin.framesForwardKinematics(_gm, _sd, np.zeros(14))
++            SH_L = _sd.oMi[_gm.getJointId("left_shoulder_pitch_joint")].translation.copy()
++            SH_R = _sd.oMi[_gm.getJointId("right_shoulder_pitch_joint")].translation.copy()
++            ARM_SCALE = float(os.getenv("XR_ARM_SCALE", "0.6"))
++            ARM_REACH = float(os.getenv("XR_ARM_REACH", "0.43"))
++            logger_mp.info(f"[local patch] arm scale {ARM_SCALE} about the shoulders, reach cap {ARM_REACH} m, gravity ff x{GFF} at measured q, "
++                           f"max lead {arm_ctrl.max_lead} rad")
+         elif args.arm == "G1_23":
+             arm_ik = G1_23_ArmIK()
+             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+@@ -270,19 +308,33 @@ if __name__ == '__main__':
+         logger_mp.info("🔴  Press [q] to stop and exit the program.")
+         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+         READY = True                  # now ready to (1) enter START state
++        if args.input_mode == "controller":
++            logger_mp.info("🎮  Or press X on the left controller to start; A pauses + homes, X resumes.")
+         while not START and not STOP: # wait for start or stop signal.
+             time.sleep(0.033)
++            # [local patch] left X (aButton) also starts tracking
++            _td = tv_wrapper.get_tele_data()
++            if args.input_mode == "controller" and _td.motion_data_ready and _td.left_ctrl_aButton:
++                START = True
++            # [local patch] never start without headset data: IK on the default wrist poses swings the arms
++            # (2026-10-31: r was pressed while the headset was in another app; the right arm jumped)
++            if START and not _td.motion_data_ready:
++                START = False
++                logger_mp.warning("No headset controller data yet: open the teleop page in the PICO browser and enter VR, then start again.")
+             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                 head_img = img_client.get_head_frame()
+                 if head_img.bgr is not None:
+                     tv_wrapper.render_to_xr(head_img.bgr)
+ 
+         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
++        arm_ctrl.engage()   # [local patch] hold the measured pose and start the soft-start speed ramp
++        ik_reset(arm_ik, arm_ctrl.get_current_dual_arm_q())
+ 
+         head_img = None
+         left_wrist_img = None
+         right_wrist_img = None
+ 
++        x_prev = True  # [local patch] X edge detection; the X that started us must be released first
+         # main loop. robot start to follow VR user's motion
+         while not STOP:
+             start_time = time.time()
+@@ -346,17 +398,30 @@ if __name__ == '__main__':
+             
+             # high level control
+             if args.input_mode == "controller" and args.motion:
+-                # quit teleoperate
+-                if tele_data.right_ctrl_aButton:
+-                    START = False
+-                    STOP = True
++                # [local patch] A: pause, home the arms and hand them to the locomotion controller (program keeps
++                # running); X: take the arms back and resume tracking. Keyboard q still exits.
++                x_now = tele_data.left_ctrl_aButton
++                if tele_data.right_ctrl_aButton and TRACKING:
++                    TRACKING = False
++                    logger_mp.info("⏸  A pressed: pausing and homing the arms. Press X to resume.")
++                    arm_ctrl.ctrl_dual_arm_go_home()
++                    logger_mp.info("⏸  Paused. Press X to resume, or q in this terminal to exit.")
++                elif x_now and not x_prev and not TRACKING:
++                    logger_mp.info("▶️  X pressed: resuming tracking.")
++                    arm_ctrl.engage()
++                    ik_reset(arm_ik, arm_ctrl.get_current_dual_arm_q())
++                    TRACKING = True
++                x_prev = x_now
+                 # command robot to enter damping mode. soft emergency stop function
+                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
+-                    loco_wrapper.Damp()
++                    loco_wrapper.Enter_Damp_Mode()
+                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
+-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
+-                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
+-                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
++                # [local patch] XR_NO_LOCO=1: send no Move at all, so walking comes only from the Unitree remote
++                # (otherwise an idle stick sends Move(0,0,0) every cycle and fights the remote).
++                if not NO_LOCO:
++                    loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
++                                      -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
++                                      -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+ 
+             # get current robot state data.
+             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
+@@ -364,10 +429,26 @@ if __name__ == '__main__':
+ 
+             # solve ik using motor data and wrist pose, then use ik results to control arms.
+             time_ik_start = time.time()
+-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+-            time_ik_end = time.time()
+-            logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
++            lw_target = scale_wrist(tele_data.left_wrist_pose, SH_L); rw_target = scale_wrist(tele_data.right_wrist_pose, SH_R)
++            if TRACKING and tele_data.motion_data_ready:
++                # [local patch] warm start from the previous solution (None), not the measured q: a drifted arm made the
++                # IK jump to another branch
++                sol_q, sol_tauff  = arm_ik.solve_ik(lw_target, rw_target, None, current_lr_arm_dq)
++                time_ik_end = time.time()
++                logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
++                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
++            else:
++                sol_q, sol_tauff = current_lr_arm_q, np.zeros_like(current_lr_arm_q)
++            if TRACE_DIR:
++                # t, tracking, ready, ik_s, head(16), lwrist(16), rwrist(16), ltrig, rtrig, X, Y, A, B, lstick(2),
++                # rstick(2), sol_q(14), sol_tauff(14), meas_q(14), meas_dq(14)
++                _trace.append(np.concatenate([[time.time(), float(TRACKING), float(tele_data.motion_data_ready),
++                    (time.time() - time_ik_start)], np.ravel(tele_data.head_pose), np.ravel(tele_data.left_wrist_pose),
++                    np.ravel(tele_data.right_wrist_pose), [tele_data.left_ctrl_triggerValue, tele_data.right_ctrl_triggerValue,
++                    tele_data.left_ctrl_aButton, tele_data.left_ctrl_bButton, tele_data.right_ctrl_aButton,
++                    tele_data.right_ctrl_bButton], tele_data.left_ctrl_thumbstickValue, tele_data.right_ctrl_thumbstickValue,
++                    sol_q, sol_tauff, current_lr_arm_q, current_lr_arm_dq, lw_target[:3, 3], rw_target[:3, 3]]))
++                trace_flush()
+ 
+             # record data
+             if args.record:
+@@ -575,5 +656,6 @@ if __name__ == '__main__':
+                 recorder.close()
+         except Exception as e:
+             logger_mp.error(f"Failed to close recorder: {e}")
++        trace_flush(force=True)
+         logger_mp.info("✅ Finally, exiting program.")
+         exit(0)
+diff --git a/teleop/televuer b/teleop/televuer
+--- a/teleop/televuer
++++ b/teleop/televuer
+@@ -1 +1 @@
+-Subproject commit 766de45e74373ae0ea66321d942ce538385655a5
++Subproject commit 766de45e74373ae0ea66321d942ce538385655a5-dirty

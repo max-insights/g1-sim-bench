@@ -1,0 +1,23 @@
+televuer HEAD 766de45 [update] motion_data_ready signal
+diff --git a/src/televuer/televuer.py b/src/televuer/televuer.py
+index 1250131..fba63d8 100644
+--- a/src/televuer/televuer.py
++++ b/src/televuer/televuer.py
+@@ -313,9 +313,14 @@ class TeleVuer:
+             with self.motion_data_ready_shared.get_lock():
+                 self.motion_data_ready_shared.value = True
+ 
+-        except:
+-            pass
+-    
++        except Exception as e:
++            # [local debug] report parse failures once instead of swallowing them
++            self._dbg_hand_err = getattr(self, "_dbg_hand_err", 0) + 1
++            if self._dbg_hand_err <= 5:
++                v = event.value if isinstance(getattr(event, "value", None), dict) else {}
++                lens = {k: (len(x) if hasattr(x, "__len__") else type(x).__name__) for k, x in v.items()}
++                print(f"[televuer debug] on_hand_move failed: {e!r}; lens={lens}; left={type(v.get('left')).__name__} {repr(v.get('left'))[:300]}", flush=True)
++
+     ## immersive MODE
+     async def main_image_binocular_zmq(self, session):
+         if self.use_hand_tracking:
