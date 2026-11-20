@@ -1,0 +1,51 @@
+"""Run a decoupled-WBC entry point with our overrides (the upstream files stay untouched).
+
+    python dwbc_run.py control [tyro args ...]     # decoupled_wbc ... run_g1_control_loop
+    python dwbc_run.py teleop  [tyro args ...]     # decoupled_wbc ... run_teleop_policy_loop
+
+DWBC_DDS_DOMAIN  Unitree DDS domain for the control loop and its MuJoCo sim (the yaml hard-codes 0). The sim uses 7:
+                 another session's fake_g1.py sits on lo / domain 0 and fake_g1_phys.py on domain 9.
+DWBC_KP_SCALE    optional, e.g. "0.8": scales every MOTOR_KP (not used by default).
+"""
+import os
+import runpy
+import sys
+
+import decoupled_wbc.control.main.teleop.configs.configs as C
+
+_orig = C.override_wbc_config
+
+
+def _override(wbc_config, config, missed_keys_only=False):
+    out = _orig(wbc_config, config, missed_keys_only)
+    dom = os.environ.get("DWBC_DDS_DOMAIN")
+    if dom is not None:
+        out["DOMAIN_ID"] = int(dom)
+    s = os.environ.get("DWBC_KP_SCALE")
+    if s:
+        out["MOTOR_KP"] = [float(k) * float(s) for k in out["MOTOR_KP"]]
+    print(f"[dwbc_run] DOMAIN_ID={out.get('DOMAIN_ID')} INTERFACE={out.get('INTERFACE')} ENV_TYPE={out.get('ENV_TYPE')}",
+          flush=True)
+    return out
+
+
+C.override_wbc_config = _override
+
+if os.environ.get("DWBC_DRY") == "1":
+    # dry run against dwbc_fake_robot.py: no Unitree MotionSwitcher service there. Upstream's real-mode
+    # BodyStateProcessor calls CheckMode/ReleaseMode at start (it releases the mode itself on the robot).
+    from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+
+    MotionSwitcherClient.CheckMode = lambda self: (0, {"name": ""})
+    MotionSwitcherClient.ReleaseMode = lambda self: (0, None)
+    print("[dwbc_run] DRY: MotionSwitcher stubbed (no mode active)", flush=True)
+
+MODULES = {
+    "control": "decoupled_wbc.control.main.teleop.run_g1_control_loop",
+    "teleop": "decoupled_wbc.control.main.teleop.run_teleop_policy_loop",
+}
+if len(sys.argv) < 2 or sys.argv[1] not in MODULES:
+    sys.exit(__doc__)
+mod = MODULES[sys.argv[1]]
+sys.argv = [mod] + sys.argv[2:]
+runpy.run_module(mod, run_name="__main__")

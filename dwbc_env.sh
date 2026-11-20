@@ -1,0 +1,24 @@
+# Environment for NVIDIA Decoupled WBC (GR00T-WholeBodyControl/decoupled_wbc) on the workstation.
+#   source ~/piper_ws/dwbc/dwbc_env.sh
+# conda env (no sudo, no Docker): python 3.10 + ROS 2 Humble rclpy from RoboStack + pip deps, built 2026-11-17.
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate /data/Jiangzehua_Data/20261019_G1_WBC/envs/dwbc
+export DWBC_REPO=$HOME/piper_ws/GR00T-WholeBodyControl
+# conda's libstdc++ first: a pip wheel imported before torch otherwise pulls the older system one (CXXABI_1.3.15 error)
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# decoupled_wbc is used from the repo (its pyproject cannot be pip-installed: readme sits outside the package)
+# + the XRoboToolkit pybind SDK already built for SONIC's .venv_teleop (cp310)
+export PYTHONPATH=$DWBC_REPO:$DWBC_REPO/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64${PYTHONPATH:+:$PYTHONPATH}
+# ROS 2 only links our own processes: private domain, loopback only, so nothing reaches the robot's DDS on enp13s0.
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-77}
+export ROS_LOCALHOST_ONLY=1
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export DWBC_LOGS=$HOME/piper_ws/dwbc_logs
+# waist in the arm IK -> the leg policy leans the torso (upstream --enable-waist); DWBC_ENABLE_WAIST=0 turns it off
+export DWBC_ENABLE_WAIST=${DWBC_ENABLE_WAIST:-1}
+# arm IK posture weight (upstream 0.01 gets stuck: pinned elbow / backward lean); unset it to go back to upstream
+export DWBC_IK_POSTURE_COST=${DWBC_IK_POSTURE_COST:-0.01}
+# multi-start (global) arm IK, dwbc_ik_global.py (2026-11-18); DWBC_IK_GLOBAL=0 turns it off
+export DWBC_IK_GLOBAL=${DWBC_IK_GLOBAL:-1}
+# A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
+export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
