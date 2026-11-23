@@ -260,6 +260,19 @@ HOPS = [  # key, label
 ]
 
 
+# The overview: PICO motion -> robot at the target, cut into five blocks that add up (p50 each, ms).
+BLOCKS = [  # key, label, what it is / what moves it
+    ("pico", "PICO→工作站", "Wi‑Fi + XRoboToolkit 服务 = [1]。头显时钟没和工作站同步，这是相对整场最快一帧多出来的部分，看波动不看绝对值"),
+    ("compute", "工作站计算", "teleop 读到手柄 → 发出目标 = [3]+[4]+[5]+打包，主要是手臂 IK"),
+    ("transfer", "传输等待", "ROS 2 传输 + 等 50 Hz 控制环来取 = [6-7]+[8]，后者在 0–20 ms 之间"),
+    ("interp", "插值平滑", "控制环取到目标 → 插值轨迹到达它 = [10]。官方设计约 50 ms，用来平滑 20 Hz 的目标；关节限速时更长"),
+    ("follow", "机器人跟随", "机器人实测关节落后指令的时间 = [11]（含网线、电机 PD 跟踪），主要由手臂 PD 增益决定"),
+]
+STALL_MS = 100.0      # a frame "stalls" when PICO→指令到位 is this much above its median
+STALL_HOPS = [("pico", "PICO→工作站"), ("streamer", "读手柄"), ("ik", "手臂 IK"), ("other", "teleop 其它"),
+              ("ros", "ROS 2 传输"), ("wait", "等控制环"), ("interp", "插值限速")]
+
+
 def _f(x):
     try:
         return float(x) if x != "" else None
@@ -318,6 +331,12 @@ def control_hops(r, pico_min):
         v = d(a, b)
         if v is not None:
             h[k] = v
+    # the five blocks of the overview (BLOCKS); pico + compute + transfer + interp == pico + chain for every frame
+    c = d("t_read", "t_pub")
+    if c is not None:
+        h["compute"] = c
+    if h.get("ros") is not None and h.get("wait") is not None:
+        h["transfer"] = h["ros"] + h["wait"]
     return h
 
 
@@ -367,19 +386,26 @@ def pico_offset(r):
     return (a - b) / 1e6 if a and b else None
 
 
-def summary(ctrl_rows, track_rows, pico_min, window_s=None, lag_windows=None):
+def summary(ctrl_rows, track_rows, pico_min, window_s=None, lag_windows=None, lag_values=None):
     """JSON-able summary of control rows (only frames with the arms following) + follow lag. Used by watch / report and
     by g1_hub (state.link.dwbc, dwbc_lat_detail). lag_windows: list of track-row windows to take the median lag over
-    (whole runs); else the lag of track_rows itself."""
+    (whole runs); lag_values: those windows' lags already computed; else the lag of track_rows itself.
+
+    For the app (easy to read): blocks (five parts of e2e that add up, the largest = worst), stall (how many frames are
+    STALL_MS above the usual and which hop causes them). hops keeps every hop's p50 / p90 / max (the details)."""
     rows = [r for r in ctrl_rows if r.get("active") == "1"]
-    vals = {}
+    vals, per = {}, []
     for r in rows:
-        for k, v in control_hops(r, pico_min).items():
+        h = control_hops(r, pico_min)
+        per.append(h)
+        for k, v in h.items():
             vals.setdefault(k, []).append(v)
-    if lag_windows is not None:
-        lags = [lg for lg, n, _ in (follow_lag(w) for w in lag_windows) if lg is not None]
+    if lag_windows is not None and lag_values is None:
+        lag_values = [follow_lag(w)[0] for w in lag_windows]
+    if lag_values is not None:
+        lags = [lg for lg in lag_values if lg is not None]
         lag, nj = (pct(lags, 0.5) if lags else None), len(lags)
-        rms = follow_lag(track_rows)[2] if track_rows else None
+        rms = follow_lag(track_rows)[2] if len(track_rows or []) >= 60 else None
     else:
         lag, nj, rms = follow_lag(track_rows)
     hops = []
@@ -390,9 +416,17 @@ def summary(ctrl_rows, track_rows, pico_min, window_s=None, lag_windows=None):
     hops.append({"key": "follow", "label": "[11] 机器人跟随滞后 (实测 vs 指令)", "p50": _r(lag), "p90": None, "max": None,
                  "n": nj})
     p50 = {h["key"]: h["p50"] for h in hops}
-    e2e = None
-    if p50.get("chain") is not None:
-        e2e = _r((p50.get("pico") or 0) + p50["chain"] + (lag or 0))
+    # overview: five blocks, p50 each; e2e = their sum
+    blocks = []
+    for k, label, hint in BLOCKS:
+        v = _r(lag) if k == "follow" else _r(pct(vals.get(k, []), 0.5))
+        blocks.append({"key": k, "label": label, "ms": v, "hint": hint})
+    have = [b for b in blocks if b["ms"] is not None]
+    e2e = _r(sum(b["ms"] for b in have)) if any(b["key"] == "compute" for b in have) else None
+    for b in blocks:
+        b["pct"] = _r(100.0 * b["ms"] / e2e, 0) if e2e and b["ms"] is not None else None
+    wb = max(have, key=lambda b: b["ms"]) if e2e else None
+    stall = _stall(per)
     # the biggest single hop inside the chain (what to look at first)
     parts = [h for h in hops if h["key"] in ("pico", "streamer", "ik", "other", "ros", "wait", "ctrl", "interp", "follow")
              and h["p50"] is not None]
@@ -402,7 +436,41 @@ def summary(ctrl_rows, track_rows, pico_min, window_s=None, lag_windows=None):
     return {"window_s": window_s, "frames": len(rows), "following": bool(rows), "hops": hops, "e2e_ms": e2e,
             "chain_ms": p50.get("chain"), "follow_lag_ms": _r(lag), "follow_rms_deg": _r(rms, 2),
             "follow_n": nj, "pico_clock_ms": _r(pct(raw, 0.5)),
-            "pico_repeat_pct": _r(100.0 * (1 - new / len(rows))) if rows else None, "bottleneck": worst}
+            "pico_repeat_pct": _r(100.0 * (1 - new / len(rows))) if rows else None, "bottleneck": worst,
+            "blocks": blocks, "worst": wb["key"] if wb else None, "worst_label": wb["label"] if wb else None,
+            "worst_ms": wb["ms"] if wb else None, "worst_pct": wb["pct"] if wb else None, "stall": stall}
+
+
+def _stall(per):
+    """Frames whose PICO→指令到位 (pico + chain) is STALL_MS (and 2x) above its median, and the hop behind them: the one
+    furthest above its own median in each such frame."""
+    tot = [(h.get("pico") or 0) + h["chain"] for h in per if h.get("chain") is not None]
+    if not tot:
+        return None
+    base = pct(tot, 0.5)
+    med = {k: pct([h[k] for h in per if h.get(k) is not None], 0.5) for k, _ in STALL_HOPS}
+    n1 = n2 = 0
+    worst = 0.0
+    cause = {}
+    for h in per:
+        if h.get("chain") is None:
+            continue
+        ex = (h.get("pico") or 0) + h["chain"] - base
+        worst = max(worst, ex)
+        if ex < STALL_MS:
+            continue
+        n1 += 1
+        n2 += ex >= 2 * STALL_MS
+        k = max((k for k, _ in STALL_HOPS if h.get(k) is not None and med[k] is not None),
+                key=lambda k: h[k] - med[k], default=None)
+        if k:
+            cause[k] = cause.get(k, 0) + 1
+    ck = max(cause, key=cause.get) if cause else None
+    names = dict(STALL_HOPS)
+    return {"over_ms": STALL_MS, "frames": len(tot), "n": n1, "pct": _r(100.0 * n1 / len(tot)),
+            "pct_2x": _r(100.0 * n2 / len(tot)), "worst_extra_ms": _r(worst, 0),
+            "cause": ck, "cause_label": names.get(ck), "cause_pct": _r(100.0 * cause[ck] / n1, 0) if ck else None,
+            "causes": [{"key": k, "label": names[k], "n": c} for k, c in sorted(cause.items(), key=lambda kv: -kv[1])]}
 
 
 def _r(v, nd=1):
@@ -420,7 +488,10 @@ def run_summary(d, series=True, bin_s=1.0):
     """Whole run: the summary plus (series=True) a 1 s time series of the main hops (p50 per bin, following frames)."""
     ctrl, track, pico_min = read_run(d)
     wins = [track[i:i + 250] for i in range(0, len(track), 250)]
-    out = summary(ctrl, track, pico_min, None, lag_windows=wins)
+    wlag = [follow_lag(w)[0] for w in wins]          # 5 s windows, computed once (the slow part)
+    wt = [_f(w[0].get("t")) for w in wins]
+    out = summary(ctrl, track, pico_min, None, lag_values=wlag)
+    out["segments"] = _segments(ctrl, track, pico_min, wt, wlag)
     out["run"] = os.path.basename(d)
     t0s = [_f(r.get("t_pick")) for r in ctrl[:1]] + [_f(r.get("t")) for r in track[:1]]
     t0 = min([t for t in t0s if t is not None], default=None)
@@ -440,13 +511,10 @@ def run_summary(d, series=True, bin_s=1.0):
                 if h.get(k) is not None:
                     dst[k].append(h[k])
         lag_by_bin = {}
-        step = max(1, int(round(bin_s * 50)))
-        for i in range(0, len(track), step * 5):          # follow lag on 5 s windows, spread over its bins
-            w = track[i:i + 250]
-            lg = follow_lag(w)[0]
+        for t, lg in zip(wt, wlag):                       # follow lag on 5 s windows, spread over its bins
             if lg is not None:
-                b = int(((_f(w[0].get("t")) or t0) - t0) / bin_s)
-                for j in range(5):
+                b = int(((t or t0) - t0) / bin_s)
+                for j in range(int(round(5 / bin_s))):
                     lag_by_bin[b + j] = lg
         s = {k: [] for k in ("t",) + keys}
         for b in sorted(bins):
@@ -457,6 +525,35 @@ def run_summary(d, series=True, bin_s=1.0):
             for k in keys:
                 s[k].append(_r(v[k]))
         out["series"] = s
+    return out
+
+
+def _segments(ctrl, track, pico_min, wt, wlag):
+    """One summary per A+X following stretch (active 0 -> 1 -> 0), with its start / end (unix, from the rows' wall
+    clock) and seconds since the run start. Follow lag: the 5 s windows that start inside the stretch."""
+    spans, cur = [], None
+    for r in ctrl:
+        if r.get("active") == "1":
+            cur = cur or []
+            cur.append(r)
+        elif cur:
+            spans.append(cur)
+            cur = None
+    if cur:
+        spans.append(cur)
+    t0 = _f(ctrl[0].get("t_read")) if ctrl else None
+    out = []
+    for i, rs in enumerate(spans, 1):
+        a, b = _f(rs[0].get("t_read")), _f(rs[-1].get("t_read"))
+        if a is None or b is None:
+            continue
+        tr = [r for r in track if a <= (_f(r.get("t")) or 0) <= b]
+        lv = [lg for t, lg in zip(wt, wlag) if t is not None and a <= t <= b - 2.0]
+        s = summary(rs, tr, pico_min, None, lag_values=lv if lv else None)
+        w0, w1 = _f(rs[0].get("wall_ns")), _f(rs[-1].get("wall_ns"))
+        s.update(segment=i, start=_r(w0 / 1e9, 3) if w0 else None, end=_r(w1 / 1e9, 3) if w1 else None,
+                 start_s=_r(a - t0) if t0 is not None else None, duration_s=_r(b - a))
+        out.append(s)
     return out
 
 
@@ -491,7 +588,18 @@ def _pad(s, w=40):
 
 
 def render(title, s):
-    out = [title, "", _pad("环节") + f"{'p50':>9}{'p90':>9}{'max':>9}   (ms)"]
+    out = [title, ""]
+    if s.get("e2e_ms") is not None:
+        out.append(f"估算端到端 {s['e2e_ms']:.0f} ms（中位数）= " + " + ".join(
+            f"{b['label']} {b['ms']:.0f}" for b in s["blocks"] if b["ms"] is not None))
+        out.append(f"最严重：{s['worst_label']} {s['worst_ms']:.0f} ms，占 {s['worst_pct']:.0f}%")
+        st = s.get("stall")
+        if st:
+            out.append(f"卡顿：{st['pct']:.1f}% 的帧比平时慢 {st['over_ms']:.0f} ms 以上（{st['pct_2x']:.1f}% 慢 "
+                       f"{2 * st['over_ms']:.0f} ms 以上，最多慢 {st['worst_extra_ms']:.0f} ms）"
+                       + (f"，{st['cause_pct']:.0f}% 来自 {st['cause_label']}" if st.get("cause") else ""))
+        out.append("")
+    out.append(_pad("明细 环节") + f"{'p50':>9}{'p90':>9}{'max':>9}   (ms)")
     for h in s["hops"]:
         if h["key"] == "follow":
             continue
@@ -508,8 +616,14 @@ def render(title, s):
         out.append(f"帧数 {s['frames']}，其中 PICO 数据没更新的重复帧 {s['pico_repeat_pct']:.0f}%"
                    + (f"；PICO 时钟差 p50 {s['pico_clock_ms']:.0f} ms（两边时钟同步时即 Wi‑Fi 绝对延迟）"
                       if s["pico_clock_ms"] is not None else ""))
-        if s["e2e_ms"] is not None:
-            out.append(f"估算 PICO 动作→机器人到位（p50）：约 {s['e2e_ms']:.0f} ms = [1] + 工作站内合计 + [11]")
+    for g in s.get("segments") or []:
+        if g["segment"] == 1:
+            out += ["", "按 A+X 分段："]
+        st = g.get("stall") or {}
+        out.append(f"  第 {g['segment']} 段 {time.strftime('%H:%M:%S', time.localtime(g['start'])) if g.get('start') else '?'}"
+                   f" {g['duration_s']:>5.0f} s  端到端 {g['e2e_ms'] or 0:>4.0f}  最严重 {g['worst_label'] or '–'} "
+                   f"{g['worst_ms'] or 0:.0f}  卡顿 {st.get('pct') or 0:.0f}%"
+                   + (f"（{st['cause_label']}）" if st.get("cause") else ""))
     return "\n".join(out)
 
 
