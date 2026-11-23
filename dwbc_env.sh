@@ -22,3 +22,9 @@ export DWBC_IK_POSTURE_COST=${DWBC_IK_POSTURE_COST:-0.01}
 export DWBC_IK_GLOBAL=${DWBC_IK_GLOBAL:-1}
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
+# one math-library thread per process (2026-11-23). Unlimited, torch / numpy / OpenBLAS start a thread per core in both
+# loops and they fight (load ~40, control 10 cores, teleop 8). Sim A/B (tests/thread_ab.sh): arm IK p50 38 -> 5.5 ms,
+# p90 160 -> 8, stalls 10% -> 0, control loop missed-timing reports 75-328 -> 0. Set e.g. OMP_NUM_THREADS=24 to undo.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
