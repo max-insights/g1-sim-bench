@@ -592,12 +592,12 @@ def render(title, s):
     if s.get("e2e_ms") is not None:
         out.append(f"估算端到端 {s['e2e_ms']:.0f} ms（中位数）= " + " + ".join(
             f"{b['label']} {b['ms']:.0f}" for b in s["blocks"] if b["ms"] is not None))
-        out.append(f"最严重：{s['worst_label']} {s['worst_ms']:.0f} ms，占 {s['worst_pct']:.0f}%")
+        out.append(f"延时最大的一段：{s['worst_label']} {s['worst_ms']:.0f} ms，占 {s['worst_pct']:.0f}%")
         st = s.get("stall")
         if st:
-            out.append(f"卡顿：{st['pct']:.1f}% 的帧比平时慢 {st['over_ms']:.0f} ms 以上（{st['pct_2x']:.1f}% 慢 "
-                       f"{2 * st['over_ms']:.0f} ms 以上，最多慢 {st['worst_extra_ms']:.0f} ms）"
-                       + (f"，{st['cause_pct']:.0f}% 来自 {st['cause_label']}" if st.get("cause") else ""))
+            out.append((f"最大卡顿来源：{st['cause_label']}（占卡顿帧 {st['cause_pct']:.0f}%）；" if st.get("cause") else "")
+                       + f"卡顿帧 {st['pct']:.1f}%：比平时慢 {st['over_ms']:.0f} ms 以上（{st['pct_2x']:.1f}% 慢 "
+                       f"{2 * st['over_ms']:.0f} ms 以上，最多慢 {st['worst_extra_ms']:.0f} ms）")
         out.append("")
     out.append(_pad("明细 环节") + f"{'p50':>9}{'p90':>9}{'max':>9}   (ms)")
     for h in s["hops"]:
@@ -621,9 +621,9 @@ def render(title, s):
             out += ["", "按 A+X 分段："]
         st = g.get("stall") or {}
         out.append(f"  第 {g['segment']} 段 {time.strftime('%H:%M:%S', time.localtime(g['start'])) if g.get('start') else '?'}"
-                   f" {g['duration_s']:>5.0f} s  端到端 {g['e2e_ms'] or 0:>4.0f}  最严重 {g['worst_label'] or '–'} "
-                   f"{g['worst_ms'] or 0:.0f}  卡顿 {st.get('pct') or 0:.0f}%"
-                   + (f"（{st['cause_label']}）" if st.get("cause") else ""))
+                   f" {g['duration_s']:>5.0f} s  端到端 {g['e2e_ms'] or 0:>4.0f}  延时最大 {g['worst_label'] or '–'} "
+                   f"{g['worst_ms'] or 0:.0f}  卡顿帧 {st.get('pct') or 0:.0f}%"
+                   + (f"（最大卡顿来源 {st['cause_label']}）" if st.get("cause") else ""))
     return "\n".join(out)
 
 
