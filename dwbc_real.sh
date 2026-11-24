@@ -100,8 +100,9 @@ start() {
     # control loop (real interface -> the 192.168.123.x NIC, DDS domain 0), then its guard right away
     # arm targets limited to DWBC_ARM_SPEED rad/s (upstream default 1000 = none): turning arm following on makes the
     # targets jump to the controllers; unlimited, the arms can pass upstream's 6 rad/s safety stop
+    # 3.0 -> 3.5 (2026-11-24): sim A/B (tests/speed_ab.sh) cap 3.0 stalls 3.6% -> 0, interp max 185 -> 103 ms, joint peak 5.4-6.0 in a harsher-than-real sim (4.0 passes 6)
     start_bg real_control "$L/control.log" python -u "$HERE/dwbc_run.py" control --interface real \
-        --keyboard-dispatcher-type ros --no-enable-onscreen --upper-body-joint-speed "${DWBC_ARM_SPEED:-3.0}"
+        --keyboard-dispatcher-type ros --no-enable-onscreen --upper-body-joint-speed "${DWBC_ARM_SPEED:-3.5}"
     start_bg real_guard "$L/guard.log" python -u "$HERE/dwbc_guard.py" --pidfile "$RUN/real_control.pid" \
         --flag "$FLAG" --iface "$IFACE" --csv "$L/thermal.csv" $([ "$QUIET" = 1 ] && echo --quiet)
     for i in $(seq 60); do
