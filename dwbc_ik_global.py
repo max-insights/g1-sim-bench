@@ -52,7 +52,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
     MIN_DWELL_S = 0.3         # minimum time between two switches (a switch may retarget a running blend)
     BLEND_MIN_S = 0.6
     BLEND_RAD_PER_S = 2.0
-    VMAX = 4.0                # rad/s cap on every published joint
+    VMAX = 3.0                # rad/s cap on every published joint (below the control loop's 3.5 rad/s interpolation cap)
     WAIST_PITCH_MIN = -0.087  # rad (-5 deg)
     LIMIT_EPS = 0.02          # rad: "sitting on a limit"
     POSTURE_W = 0.6           # posture cost per rad of (weighted) distance from the home posture
@@ -100,6 +100,16 @@ class GlobalBodyIKSolver(BodyIKSolver):
     HOLD_NO_PROGRESS = True   # target still + active solution off target + a frame of steps gains nothing: keep q
     HOLD_ERR = 0.3            # task-error units (cm + deg/20)
     HOLD_MIN_GAIN = 0.02
+    # output smoothing (2026-11-24, branch ik-reach-fix; offline replay tests/ik_replay.py of the 11-24 runs): the
+    # published joints follow the IK with a bounded acceleration instead of a bare VMAX clip. A one-frame IK jump
+    # (waist lock / unlock, near-singular arm, re-convergence) used to come out as a full-VMAX step that started and
+    # stopped within one frame; now it ramps up and brakes so it stops on the target without overshoot. 0 = off
+    # (bare VMAX clip, as before).
+    OUT_AMAX = 15.0           # rad/s^2 (replay sweep 10-40: 15 cut jerk events 274 -> 11, adds no lag)
+    # relative switch margin: a candidate must also beat the active solution's task cost by this fraction. With the
+    # hands far out of reach every candidate is poor and an absolute 1.5 cm margin switched on noise (run 11-24 16:15
+    # after the e-stop: 30 switches of 20-230 deg while the targets were metres away). 0 = absolute margin only.
+    TASK_MARGIN_REL = 0.2
     clock = staticmethod(time.monotonic)   # benchmarks replace it with a simulated clock
     verbose = False                        # dwbc_run.py: print every switch to teleop.log
 
@@ -144,6 +154,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
         self.blend = None          # (t0, duration, q_from)
         self.no_switch_until = -1e9
         self.q_out = self.q_home.copy()
+        self.v_out = np.zeros(len(self.q_home))   # published joint velocity (OUT_AMAX)
         self.t_last = None
         self.rng = np.random.default_rng(0)
         self.switches = 0
@@ -362,7 +373,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
         best, best_gain, reason = None, 0.0, ""
         for k, cfg in enumerate(self.cands):
             tc, pc = self._cost(cfg)
-            if ta - tc >= self.TASK_MARGIN:
+            if ta - tc >= max(self.TASK_MARGIN, self.TASK_MARGIN_REL * ta):
                 why, gain = "tracks better", ta - tc
             elif ta - tc >= -self.TASK_SLACK and pa - pc >= self.POSTURE_MARGIN:
                 why, gain = "same tracking, natural posture", (pa - pc) * 0.5
@@ -400,8 +411,19 @@ class GlobalBodyIKSolver(BodyIKSolver):
             q_want = q_act
         dt = 0.1 if self.t_last is None else min(0.2, max(0.02, now - self.t_last))
         self.t_last = now
-        step = self.VMAX * dt
-        self.q_out = self.q_out + np.clip(q_want - self.q_out, -step, step)
+        if self.OUT_AMAX > 0:
+            # bounded-acceleration follower: the speed that can still brake to a stop at the target
+            # (sqrt(2 A |e|), capped at VMAX), reached with at most A*dt of speed change per frame, never past the target
+            e = q_want - self.q_out
+            ae = np.abs(e)
+            v_des = np.sign(e) * np.minimum(self.VMAX, np.sqrt(2.0 * self.OUT_AMAX * ae))
+            dv = self.OUT_AMAX * dt
+            self.v_out = self.v_out + np.clip(v_des - self.v_out, -dv, dv)
+            self.v_out = np.clip(self.v_out, -ae / dt, ae / dt)
+            self.q_out = self.q_out + self.v_out * dt
+        else:
+            step = self.VMAX * dt
+            self.q_out = self.q_out + np.clip(q_want - self.q_out, -step, step)
         self.robot.cache_forward_kinematics(self.q_out)
         return self.q_out.copy()
 
