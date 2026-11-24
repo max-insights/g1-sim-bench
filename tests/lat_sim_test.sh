@@ -13,7 +13,7 @@ O=$DWBC_LOGS/lattest_$(date +%Y%m%d_%H%M%S); mkdir -p "$O"
 export ROS_DOMAIN_ID=78 DWBC_DDS_DOMAIN=7 DWBC_LAT_DIR=$O PYTHONPATH=$HERE/tests/fake_pico:$PYTHONPATH
 cd /tmp
 python -u "$HERE/dwbc_run.py" control --interface sim --keyboard-dispatcher-type ros --no-enable-onscreen \
-    --upper-body-joint-speed 3.0 > "$O/control.log" 2>&1 &
+    --upper-body-joint-speed "${DWBC_ARM_SPEED:-3.0}" > "$O/control.log" 2>&1 &
 C=$!
 for i in $(seq 120); do grep -q "ROS keyboard dispatcher started" "$O/control.log" && break; sleep 0.5; done
 python -u "$HERE/dwbc_run.py" teleop --body-control-device pico --hand-control-device pico > "$O/teleop.log" 2>&1 &
