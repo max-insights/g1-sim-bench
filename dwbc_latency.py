@@ -32,6 +32,7 @@ Live view / summary (stdlib only, any python3):
   python3 ~/piper_ws/dwbc/dwbc_latency.py report [run dir]     # whole run, also writes lat_summary.txt
   default run dir: ~/piper_ws/dwbc_logs/real_latest
 """
+import collections
 import os
 import sys
 import time
@@ -247,7 +248,7 @@ def install(mode):
 
 # ------------------------------------------------------------------------------------------------ viewer / report
 HOPS = [  # key, label
-    ("pico", "[1] PICO采样→teleop读到 (超出最小值)"),
+    ("pico", "[1] PICO采样→teleop读到 (超出前后 60 s 最小值)"),
     ("period", "[2] teleop 周期 (目标 50)"),
     ("streamer", "[3] 读手柄+位姿处理"),
     ("ik", "[4] 手臂 IK"),
@@ -262,7 +263,7 @@ HOPS = [  # key, label
 
 # The overview: PICO motion -> robot at the target, cut into five blocks that add up (p50 each, ms).
 BLOCKS = [  # key, label, what it is / what moves it
-    ("pico", "PICO→工作站", "Wi‑Fi + XRoboToolkit 服务 = [1]。头显时钟没和工作站同步，这是相对整场最快一帧多出来的部分，看波动不看绝对值"),
+    ("pico", "PICO→工作站", "Wi‑Fi + XRoboToolkit 服务 = [1]。头显时钟没和工作站同步且会漂移（实测约 2–3 ms/分钟），这是相对前后 60 s 内最快一帧多出来的部分，看波动不看绝对值"),
     ("compute", "工作站计算", "teleop 读到手柄 → 发出目标 = [3]+[4]+[5]+打包，主要是手臂 IK"),
     ("transfer", "传输等待", "ROS 2 传输 + 等 50 Hz 控制环来取 = [6-7]+[8]，后者在 0–20 ms 之间"),
     ("interp", "插值平滑", "控制环取到目标 → 插值轨迹到达它 = [10]。官方设计约 50 ms，用来平滑 20 Hz 的目标；关节限速时更长"),
@@ -310,13 +311,15 @@ class Tail:
 
 
 def control_hops(r, pico_min):
-    """r: a lat_control.csv row (strings). Returns {hop: ms} for the hops present."""
-    g = {k: _f(v) for k, v in r.items()}
+    """r: a lat_control.csv row (strings). Returns {hop: ms} for the hops present. The PICO hop is measured against the
+    row's own baseline r["_pb"] (pico_baseline / Live: min offset in a 60 s window) when set, else against pico_min."""
+    g = {k: _f(v) for k, v in r.items() if k != "_pb"}
     h = {}
     if g.get("wall_ns") and g.get("pico_ts_ns"):
         h["pico_raw"] = (g["wall_ns"] - g["pico_ts_ns"]) / 1e6
-        if pico_min is not None:
-            h["pico"] = h["pico_raw"] - pico_min
+        base = r.get("_pb", pico_min)
+        if base is not None:
+            h["pico"] = h["pico_raw"] - base
     for k, c in (("period", "period_ms"), ("streamer", "streamer_ms"), ("ik", "ik_ms")):
         if g.get(c) is not None:
             h[k] = g[c]
@@ -477,10 +480,36 @@ def _r(v, nd=1):
     return None if v is None else round(float(v), nd)
 
 
+PICO_BASE_S = 60.0   # the PICO hop is measured against the fastest frame within this window (clock drift, 2026-11-24)
+
+
+def pico_baseline(rows, window_s=PICO_BASE_S):
+    """Sets r["_pb"] on every row with a PICO timestamp: the smallest workstation - PICO offset within +-window_s/2 of
+    it (by t_read). The headset clock is not synchronised and drifts against the workstation (2.7 ms/min on 2026-11-23,
+    75 ms over a 28 min run), so one minimum for a whole run counts the drift as Wi-Fi delay. O(n), monotonic deque."""
+    pts = []
+    for r in rows:
+        o, t = pico_offset(r), _f(r.get("t_read"))
+        if o is not None and t is not None:
+            pts.append((t, o, r))
+    half = window_s / 2
+    q, j = collections.deque(), 0          # indexes into pts, offsets increasing; window [t - half, t + half]
+    for t, _, r in pts:
+        while j < len(pts) and pts[j][0] <= t + half:
+            while q and pts[q[-1]][1] >= pts[j][1]:
+                q.pop()
+            q.append(j)
+            j += 1
+        while q and pts[q[0]][0] < t - half:
+            q.popleft()
+        r["_pb"] = pts[q[0]][1]
+
+
 def read_run(d):
     ctrl = Tail(os.path.join(d, "lat_control.csv")).read()
     track = Tail(os.path.join(d, "lat_track.csv")).read()
     offs = [o for o in (pico_offset(r) for r in ctrl) if o is not None]
+    pico_baseline(ctrl)
     return ctrl, track, (min(offs) if offs else None)
 
 
@@ -634,13 +663,21 @@ class Live:
         self.d, self.window = d, window
         self.tc, self.tt = Tail(os.path.join(d, "lat_control.csv")), Tail(os.path.join(d, "lat_track.csv"))
         self.ctrl, self.track, self.pico_min, self.last_t = [], [], None, None
+        self._pq = collections.deque()    # (t_read, offset) of the last PICO_BASE_S s, offsets increasing
 
     def update(self):
         new = self.tc.read()
-        for r in new:
-            v = pico_offset(r)
+        for r in new:                     # trailing 60 s minimum as each row's PICO baseline (clock drift)
+            v, t = pico_offset(r), _f(r.get("t_read"))
             if v is not None:
                 self.pico_min = v if self.pico_min is None else min(self.pico_min, v)
+            if v is not None and t is not None:
+                while self._pq and self._pq[-1][1] >= v:
+                    self._pq.pop()
+                self._pq.append((t, v))
+                while self._pq[0][0] < t - PICO_BASE_S:
+                    self._pq.popleft()
+                r["_pb"] = self._pq[0][1]
         self.ctrl.extend(new)
         self.track.extend(self.tt.read())
         ts = [_f(r.get("t_pick")) for r in self.ctrl[-1:]] + [_f(r.get("t")) for r in self.track[-1:]]
