@@ -23,6 +23,8 @@ Recording (inside the two processes, installed by dwbc_run.py when DWBC_LATENCY 
   <run dir>/lat_teleop.csv    one row per teleop frame
   <run dir>/lat_control.csv   one row per goal the control loop picked up (the whole chain [1]-[10] in one row)
   <run dir>/lat_track.csv     one row per control cycle: commanded and measured arm joints (for [11])
+  <run dir>/teleop_pose.csv   one row per published teleop frame: what the operator did (2026-11-24, for datasets:
+                              g1_hub copies an episode's rows into ep_*/streams/dwbc_teleop.bin). Columns: POSE_DOC.
   The run dir is $DWBC_LAT_DIR, else the directory of the process's stdout log (dwbc_real.sh: real_<stamp>/).
   The instrumentation never changes what the loops compute and never raises into them: on any error it prints
   once and switches itself off.
@@ -43,6 +45,17 @@ TELEOP_COLS = ["seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms"
 CONTROL_COLS = ["seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms", "streamer_ms", "ik_ms",
                 "action_ms", "t_pub", "t_arrive", "t_pick", "t_target", "t_waypoint", "t_sent", "active"]
 N_ARM = 14
+# teleop_pose.csv: t_wall_ns / t_mono_ns = when the goal was published (workstation clocks, same as the recorder's
+# t_recv_ns / t_mono_ns); pico_ts_ns = the PICO's own clock; active = teleop engaged. PICO poses are raw XRoboToolkit
+# [x, y, z, qx, qy, qz, qw] in the headset's world frame; wrist_* = the IK targets in the robot frame [x, y, z, qw, qx,
+# qy, qz] (TeleopPolicy wrist_pose); nav = navigate_cmd [vx, vy, wz], height = base_height_command (blank if absent);
+# q* = target_upper_body_pose (IK output, upper-body joint order of the DWBC robot model).
+POSE_PICO = ("left_pose", "right_pose", "head_pose")
+POSE_KEYS = ("left_trigger", "right_trigger", "left_grip", "right_grip")
+POSE_DOC = (["t_wall_ns", "t_mono_ns", "seq", "pico_ts_ns", "active"]
+            + [f"{n}{i}" for n in POSE_PICO for i in range(7)] + list(POSE_KEYS)
+            + [f"wrist_{side}{i}" for side in ("l", "r") for i in range(7)]
+            + ["nav0", "nav1", "nav2", "height"])            # + q0..q<N-1>, N known at the first frame
 
 _on = True
 _files = {}
@@ -129,6 +142,45 @@ def _wrap(cls, name, pre, post):
 
 # ----- teleop process
 _tp = {"seq": 0, "last_ts": None, "last_read": None}
+_pose = {"on": True, "pico": None, "wrist": None, "q": None, "nav": None, "height": None, "nq": None}
+
+
+def _pose_off(e):
+    if _pose["on"]:
+        _pose["on"] = False
+        print(f"[dwbc_latency] teleop_pose.csv disabled after an error: {e!r} (control is not affected)", flush=True)
+
+
+def _vals(x, n):
+    """n floats from a sequence (blank cells when missing / short)."""
+    try:
+        v = [float(a) for a in list(x)[:n]]
+    except Exception:  # noqa: BLE001
+        v = []
+    return v + [None] * (n - len(v))
+
+
+def _pose_row():
+    q = _pose["q"]
+    if _pose["nq"] is None:
+        if q is None:
+            return None
+        _pose["nq"] = len(q)
+        _open("teleop_pose.csv", POSE_DOC + [f"q{i}" for i in range(_pose["nq"])])
+    d = _pose["pico"] or {}
+    nav = _pose["nav"]
+    row = [time.time_ns(), time.monotonic_ns(), _tp.get("seq"), _tp.get("pico_ts_ns"), _tp.get("active")]
+    for n in POSE_PICO:
+        row += _vals(d.get(n) if d.get(n) is not None else (), 7)
+    for k in POSE_KEYS:
+        v = d.get(k)
+        row.append(float(v) if isinstance(v, (int, float)) else None)
+    row += _vals(_pose["wrist"] if _pose["wrist"] is not None else (), 14)
+    row += _vals(nav if nav is not None else (), 3)
+    h = _pose["height"]
+    row.append(float(h) if isinstance(h, (int, float)) else None)
+    row += _vals(q if q is not None else (), _pose["nq"])
+    return row
 
 
 def install_teleop():
@@ -148,6 +200,8 @@ def install_teleop():
         _tp["pico_new"] = ts != _tp["last_ts"]
         _tp["period_ms"] = None if _tp["last_read"] is None else (t - _tp["last_read"]) * 1e3
         _tp["last_ts"], _tp["last_read"] = ts, t
+        if _pose["on"]:
+            _pose["pico"] = {k: d.get(k) for k in POSE_PICO + POSE_KEYS}
 
     _wrap(PS.PicoStreamer, "_get_pico_data", None, pico_post)
     _wrap(TS.TeleopStreamer, "get_streamer_data", lambda self: mono(),
@@ -158,12 +212,21 @@ def install_teleop():
     def act_pre(self):
         for k in ("t_read", "pico_ts_ns", "wall_ns", "pico_new", "period_ms", "streamer_ms", "ik_ms"):
             _tp[k] = None
+        _pose["pico"] = None
         return mono()
 
     def act_post(self, t0, action):
         _tp["seq"] += 1
         _tp["action_ms"] = (mono() - t0) * 1e3
         _tp["active"] = bool(getattr(self, "is_active", False))
+        if isinstance(action, dict) and _pose["on"]:
+            try:
+                _pose["wrist"] = action.get("wrist_pose")
+                _pose["q"] = action.get("target_upper_body_pose")
+                _pose["nav"] = action.get("navigate_cmd")
+                _pose["height"] = action.get("base_height_command")
+            except Exception as e:  # noqa: BLE001
+                _pose_off(e)
         if isinstance(action, dict):
             action["lat"] = {k: _tp.get(k) for k in ("seq", "t_read", "pico_ts_ns", "wall_ns", "pico_new",
                                                         "period_ms", "streamer_ms", "ik_ms", "action_ms", "active")}
@@ -178,6 +241,13 @@ def install_teleop():
             return
         row = dict(_tp, pub_ms=(mono() - t0) * 1e3)
         _write("lat_teleop.csv", ",".join(_fmt(row.get(c)) for c in TELEOP_COLS))
+        if _pose["on"]:
+            try:
+                pr = _pose_row()
+                if pr is not None:
+                    _write("teleop_pose.csv", ",".join(_fmt(v) for v in pr))
+            except Exception as e:  # noqa: BLE001
+                _pose_off(e)
 
     _wrap(RU.ROSMsgPublisher, "publish", pub_pre, pub_post)
     print("[dwbc_latency] teleop instrumentation on", flush=True)
