@@ -111,6 +111,8 @@ def main():
     n_reset = 0
     pub_cfg = None
     diag, q_act = [], []
+    import time as _time
+    t_cpu = 0.0
     for r in rows:
         t = int(r["t_mono_ns"]) / 1e9
         if (a.t0 is not None and t - tb < a.t0) or (a.t1 is not None and t - tb > a.t1):
@@ -133,7 +135,9 @@ def main():
         sim["t"] = t
         body = {lf: pose_mat(w[:7]), rf: pose_mat(w[7:])}
         ik.set_goal({"body_data": body, "left_hand_data": None, "right_hand_data": None})
+        _c0 = _time.perf_counter()
         q = np.asarray(ik.get_action(), dtype=float)
+        t_cpu += _time.perf_counter() - _c0
         out_new.append(not prev_active)
         out_t.append(t - tb)
         out_tgt.append(w)
@@ -184,6 +188,7 @@ def main():
                 "at_vmax": int(capped.sum()), "at_vmax_pct": round(100 * capped.sum() / max(1, ok.sum()), 2),
                 "acc_mrad": round(1000 * float(acc), 3)}
 
+    res["ms_per_frame"] = round(1000 * t_cpu / max(1, len(out_t)), 2)
     res["replay"] = smooth(qr)
     res["logged"] = smooth(ql)
     d = np.abs(qr - ql)[:, arm | waist]
@@ -195,6 +200,7 @@ def main():
                            "frac_gt10": round(float((se > 10).mean()), 3)}
     sw = getattr(solver, "switch_log", [])
     res["switches"] = len(sw)
+    res["switch_log"] = [[round(float(x[0]) - tb, 1), round(float(np.degrees(x[1]))), str(x[3])[:70]] for x in sw]
     res["switch_deg_p50"] = round(float(np.degrees(np.median([s[1] for s in sw]))), 1) if sw else None
     res["waist_changes"] = len(getattr(solver, "waist_log", []))
     extra = getattr(solver, "stats", None)
@@ -204,7 +210,7 @@ def main():
     if a.json:
         json.dump(res, open(a.json, "w"), ensure_ascii=False, indent=1)
     if a.series:
-        np.savez_compressed(a.series, t=t, tgt=tgt, q_log=ql, q_rep=qr, names=np.array(names), diag=np.array(diag),
+        np.savez_compressed(a.series, t=t, tgt=tgt, q_log=ql, q_rep=qr, names=np.array(names), diag=np.array(diag), err=np.array(out_err),
                             q_act=np.array(q_act), red_names=np.array(solver.robot.joint_names))
 
 
