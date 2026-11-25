@@ -4,7 +4,7 @@ train / test, replayed offline through the arm IK (tests/ik_replay.py: reproduce
 
     python tests/ik_bench.py add  real_YYYYMMDD_HHMMSS --split train|test [--t0 S --t1 S] [--note "..."]
     python tests/ik_bench.py list
-    python tests/ik_bench.py run  NAME [--split train|test|all] [--smooth 0|1] [--set ATTR=VALUE ...] [-j 4]
+    python tests/ik_bench.py run  NAME [--split train|test|all] [--smooth 0|1] [--set ATTR=VALUE ...] [-j 4] [--skip-existing]
     python tests/ik_bench.py compare NAME [NAME ...] [--split ...]
 
 Assets live in $IK_BENCH (default /data/robot_data/g1/ik_bench): assets/<id>/teleop_pose.csv is a frozen copy (the
@@ -78,6 +78,8 @@ def cmd_run(a):
     json.dump({"smooth": a.smooth, "set": a.set}, open(os.path.join(out, "config.json"), "w"))
     procs = []
     for x in chosen(a.split):
+        if a.skip_existing and os.path.exists(os.path.join(out, x["id"] + ".npz")):
+            continue
         c = ["nice", "-n", "19", sys.executable, os.path.join(HERE, "ik_replay.py"), os.path.join(ROOT, "assets", x["id"]),
              "--json", os.path.join(out, x["id"] + ".json"), "--series", os.path.join(out, x["id"] + ".npz")]
         if x["t0"] is not None:
@@ -180,6 +182,7 @@ def main():
     p.add_argument("--smooth", default=None)
     p.add_argument("--set", action="append", default=[])
     p.add_argument("-j", type=int, default=4)
+    p.add_argument("--skip-existing", action="store_true", help="keep results of assets already replayed")
     p = sub.add_parser("compare")
     p.add_argument("names", nargs="+")
     p.add_argument("--split", default="train", choices=["train", "test", "all"])
