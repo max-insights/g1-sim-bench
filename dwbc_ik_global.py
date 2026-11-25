@@ -126,6 +126,10 @@ class GlobalBodyIKSolver(BodyIKSolver):
     UNLOCK_RAMP_S = 0.0         # replay: no effect once WAIST_VMAX bounds the waist (kept as an option)
     SING_SV = 0.04
     SING_DAMP = 0.05
+    # waist roll held at its home angle (2026-11-25, operator request after the real IK A/B): at the edge of reach the
+    # waist still helps through yaw / pitch, but the torso no longer leans sideways (waist roll is also the motor that
+    # overheated on 11-23). False = roll free as before. dwbc_run.py: DWBC_IK_LOCK_ROLL.
+    LOCK_WAIST_ROLL = False
     clock = staticmethod(time.monotonic)   # benchmarks replace it with a simulated clock
     verbose = False                        # dwbc_run.py: print every switch to teleop.log
 
@@ -139,6 +143,13 @@ class GlobalBodyIKSolver(BodyIKSolver):
         if wp is not None:
             self.lo[wp] = max(self.lo[wp], self.WAIST_PITCH_MIN)
             model.lowerPositionLimit[wp] = self.lo[wp]
+        self.fixed = np.zeros(len(self.lo), dtype=bool)   # joints the IK never moves (LOCK_WAIST_ROLL)
+        wr = idx.get("waist_roll_joint")
+        if self.LOCK_WAIST_ROLL and wr is not None:
+            r0 = float(np.clip(self.configuration.q[wr], self.lo[wr], self.hi[wr]))
+            self.lo[wr], self.hi[wr] = r0 - 1e-6, r0 + 1e-6
+            model.lowerPositionLimit[wr], model.upperPositionLimit[wr] = self.lo[wr], self.hi[wr]
+            self.fixed[wr] = True
         self.q_home = np.clip(self.configuration.q.copy(), self.lo, self.hi)
         self.configuration.update(self.q_home.copy())
         # posture weights for the cost: waist counts 3x (a leaning torso moves the whole robot)
@@ -331,7 +342,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
         c = self._task_err(cfg)
         q = cfg.q
         margin = np.minimum(q - self.lo, self.hi - q)
-        c += 0.5 * float(np.sum((margin < self.LIMIT_EPS) & self.armwaist))
+        c += 0.5 * float(np.sum((margin < self.LIMIT_EPS) & self.armwaist & ~self.fixed))
         return c, self.POSTURE_W * float(np.linalg.norm((q - self.q_home) * self.pw))
 
     # ------------------------------------------------------------------ main
