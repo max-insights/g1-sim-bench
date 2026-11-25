@@ -130,6 +130,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
     # waist still helps through yaw / pitch, but the torso no longer leans sideways (waist roll is also the motor that
     # overheated on 11-23). False = roll free as before. dwbc_run.py: DWBC_IK_LOCK_ROLL.
     LOCK_WAIST_ROLL = False
+    WAIST_ROLL_MAX_DEG = 0.0   # with LOCK_WAIST_ROLL: roll may still move this far from home (0 = held fixed)
     clock = staticmethod(time.monotonic)   # benchmarks replace it with a simulated clock
     verbose = False                        # dwbc_run.py: print every switch to teleop.log
 
@@ -147,9 +148,10 @@ class GlobalBodyIKSolver(BodyIKSolver):
         wr = idx.get("waist_roll_joint")
         if self.LOCK_WAIST_ROLL and wr is not None:
             r0 = float(np.clip(self.configuration.q[wr], self.lo[wr], self.hi[wr]))
-            self.lo[wr], self.hi[wr] = r0 - 1e-6, r0 + 1e-6
+            m = max(1e-6, np.radians(self.WAIST_ROLL_MAX_DEG))
+            self.lo[wr], self.hi[wr] = max(self.lo[wr], r0 - m), min(self.hi[wr], r0 + m)
             model.lowerPositionLimit[wr], model.upperPositionLimit[wr] = self.lo[wr], self.hi[wr]
-            self.fixed[wr] = True
+            self.fixed[wr] = m < 1e-3
         self.q_home = np.clip(self.configuration.q.copy(), self.lo, self.hi)
         self.configuration.update(self.q_home.copy())
         # posture weights for the cost: waist counts 3x (a leaning torso moves the whole robot)

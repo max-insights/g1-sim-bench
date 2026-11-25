@@ -23,9 +23,12 @@ export DWBC_IK_GLOBAL=${DWBC_IK_GLOBAL:-1}
 # arm IK smoothing v2 (2026-11-24: speed bound inside the IK, singularity damping; offline replay: joint jerks
 # 17 -> 2 per minute, hand offset unchanged). 0 = the IK as before. Takes effect at the next DWBC start.
 export DWBC_IK_SMOOTH=${DWBC_IK_SMOOTH:-1}
-# waist roll held at 0 by the arm IK (2026-11-25): at the edge of reach the waist helps by turning / bending forward
-# only, no sideways lean (waist roll overheated on 11-23). 0 = roll free as before. Takes effect at the next DWBC start.
+# waist roll limited by the arm IK (2026-11-25): less sideways lean at the edge of reach (waist roll overheated on
+# 11-23). Replay of the 11-25 13:55 run: roll range 41 -> 20 deg with +-10, hand error unchanged (>3 cm 1.71 -> 1.69
+# s/min); held fixed (ROLL_MAX_DEG=0) it got worse (2.51 s/min). DWBC_IK_LOCK_ROLL=0 = roll free as before.
+# Takes effect at the next DWBC start.
 export DWBC_IK_LOCK_ROLL=${DWBC_IK_LOCK_ROLL:-1}
+export DWBC_IK_ROLL_MAX_DEG=${DWBC_IK_ROLL_MAX_DEG:-10}
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
 # single-step mode (2026-11-23, dwbc_step_ext.py): PICO left stick click toggles it, a flick = one step;

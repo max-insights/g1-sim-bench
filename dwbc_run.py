@@ -9,7 +9,7 @@ DWBC_ENABLE_WAIST "1": add --enable-waist (waist in the arm IK -> torso lean to 
 DWBC_IK_POSTURE_COST e.g. "0.1": arm IK posture task weight for the teleop loop (upstream 0.01).
 DWBC_IK_GLOBAL   "1": multi-start (global) arm IK for the teleop loop (dwbc_ik_global.py).
 DWBC_IK_SMOOTH   "1": its smoothing v2 (2026-11-24); else the solver as before.
-DWBC_IK_LOCK_ROLL "1": the arm IK never moves waist roll (2026-11-25).
+DWBC_IK_LOCK_ROLL "1": the arm IK limits waist roll to +-DWBC_IK_ROLL_MAX_DEG (0 = held fixed) (2026-11-25).
 DWBC_ABXY_RESET  "1": A+B+X+Y returns slowly to the standing pose (dwbc_teleop_ext.py).
 DWBC_KP_SCALE    optional, e.g. "0.8": scales every MOTOR_KP (not used by default).
 DWBC_WAIST_PITCH_KD e.g. "0": waist pitch kd override (real upstream: -5), unset = upstream.
@@ -99,8 +99,12 @@ if os.environ.get("DWBC_IK_GLOBAL") == "1" and sys.argv[1] == "teleop":
     # else = the solver as before 11-24 (default, until the real-robot A/B is done)
     print("[dwbc_run] arm IK " + _IKG.set_smoothing(os.environ.get("DWBC_IK_SMOOTH") == "1"), flush=True)
     # DWBC_IK_LOCK_ROLL (2026-11-25): "1" = the IK never moves waist roll (no sideways lean at the edge of reach)
+    # DWBC_IK_ROLL_MAX_DEG: with the lock, roll may still move this far from home (0 = held fixed)
     GlobalBodyIKSolver.LOCK_WAIST_ROLL = os.environ.get("DWBC_IK_LOCK_ROLL") == "1"
-    print(f"[dwbc_run] arm IK waist roll {'LOCKED' if GlobalBodyIKSolver.LOCK_WAIST_ROLL else 'free'}", flush=True)
+    GlobalBodyIKSolver.WAIST_ROLL_MAX_DEG = float(os.environ.get("DWBC_IK_ROLL_MAX_DEG") or 0)
+    print("[dwbc_run] arm IK waist roll " + (("LOCKED" if GlobalBodyIKSolver.WAIST_ROLL_MAX_DEG <= 0 else
+          f"LIMITED +-{GlobalBodyIKSolver.WAIST_ROLL_MAX_DEG:g} deg") if GlobalBodyIKSolver.LOCK_WAIST_ROLL else "free"),
+          flush=True)
 # DWBC_ABXY_RESET=1 (2026-11-18): A+B+X+Y after the first press slowly returns arms + waist to the standing pose
 # (dwbc_teleop_ext.py; the streamer part is patch_reset.py in pico_streamer.py)
 if os.environ.get("DWBC_ABXY_RESET") == "1" and sys.argv[1] == "teleop":
