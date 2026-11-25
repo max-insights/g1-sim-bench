@@ -5,7 +5,7 @@ train / test, replayed offline through the arm IK (tests/ik_replay.py: reproduce
     python tests/ik_bench.py add  real_YYYYMMDD_HHMMSS --split train|test [--t0 S --t1 S] [--note "..."]
     python tests/ik_bench.py list
     python tests/ik_bench.py run  NAME [--split train|test|all] [--smooth 0|1] [--set ATTR=VALUE ...] [-j 4] [--skip-existing]
-    python tests/ik_bench.py compare NAME [NAME ...] [--split ...]
+    python tests/ik_bench.py compare NAME [NAME ...] [--split ...] [--by-activity]
 
 Assets live in $IK_BENCH (default /data/robot_data/g1/ik_bench): assets/<id>/teleop_pose.csv is a frozen copy (the
 run dir may be cleaned up later), manifest.json holds window / split / note. Split by RUN, never by frame: frames of
@@ -21,6 +21,9 @@ Scorecard (per active minute unless noted):
   roll_range         waist roll range (deg)      elbow_max  largest elbow angle (rad, straight = 1.41)
   near_limit         share of frames with an arm close to straight (smallest hand-Jacobian singular value < 0.04)
   ms                 IK time per frame
+  --by-activity      the same per activity (frames labelled from the asset): squat (height command > 5 cm below
+                     standing), step / turn (single-step events in the run's control.log, continuous walking or turning
+                     from the nav command), reach (an arm close to straight), other. A frame can carry several labels.
 """
 import argparse
 import json
@@ -58,6 +61,9 @@ def cmd_add(a):
     d = os.path.join(ROOT, "assets", aid)
     os.makedirs(d, exist_ok=True)
     shutil.copy2(src, d)
+    ctl = os.path.join(LOGS, a.run, "control.log")
+    if os.path.exists(ctl):
+        shutil.copy2(ctl, d)
     m["assets"].append({"id": aid, "run": a.run, "t0": a.t0, "t1": a.t1, "split": a.split, "note": a.note})
     save(m)
     print(f"added {aid} ({a.split})")
@@ -116,7 +122,65 @@ def swings(t, q, tgt, arm, deg):
     return c
 
 
-def score(name, ids):
+def step_events(aid):
+    """[(t_start, t_end, "step"|"turn")] from the single-step lines of control.log, on the csv clock (t_mono s)."""
+    import re
+    f = os.path.join(ROOT, "assets", aid, "control.log")
+    if not os.path.exists(f):
+        run = next(x["run"] for x in manifest()["assets"] if x["id"] == aid)
+        src = os.path.join(LOGS, run, "control.log")
+        if not os.path.exists(src):
+            return []
+        shutil.copy2(src, f)
+    ev, cur = [], None
+    for line in open(f, errors="replace"):
+        m = re.search(r"\[dwbc_step\] ([0-9.]+) (start|idle|turn)\s*(\S*)", line)
+        if not m:
+            continue
+        t, what, arg = float(m.group(1)), m.group(2), m.group(3)
+        if what == "start" or (what == "turn" and arg):
+            if cur:
+                ev.append((cur[0], t, cur[1]))
+            cur = (t, "turn" if (what == "turn" or arg.startswith("turn")) else "step")
+        elif what == "idle" and cur:
+            ev.append((cur[0], t, cur[1]))
+            cur = None
+    return ev
+
+
+_LAB = {}
+
+
+def labels(aid, t):
+    """per replay frame (t = s from the csv's first row): dict label -> bool array"""
+    import csv
+    if aid not in _LAB:
+        rows = list(csv.DictReader(open(os.path.join(ROOT, "assets", aid, "teleop_pose.csv"))))
+
+        def col(k):
+            o = np.full(len(rows), np.nan)
+            for i, r in enumerate(rows):
+                try:
+                    o[i] = float(r[k])
+                except (TypeError, ValueError, KeyError):
+                    pass
+            return o
+        tm = np.array([int(r["t_mono_ns"]) for r in rows]) / 1e9
+        _LAB[aid] = (tm, col("height"), np.stack([col(f"nav{i}") for i in range(3)], 1))
+    tm, hh, nn = _LAB[aid]
+    idx = np.clip(np.searchsorted(tm - tm[0], t - 1e-4), 0, len(tm) - 1)
+    h, nav = hh[idx], nn[idx]
+    stand = np.nanpercentile(hh, 90)
+    lab = {"squat": h < stand - 0.05,
+           "step": np.nan_to_num(np.abs(nav[:, :2])).max(1) > 0.05,
+           "turn": np.nan_to_num(np.abs(nav[:, 2])) > 0.05}
+    tabs = tm[idx]
+    for a, b, k in step_events(aid):
+        lab[k] |= (tabs >= a) & (tabs <= b + 0.5)
+    return lab
+
+
+def score(name, ids, activity=None):
     tot = {"min": 0.0, "swing40": 0, "swing25": 0, "jerk": 0, "err3": 0.0, "err5": 0.0, "near": 0.0, "ms": []}
     errs, roll, elbow = [], 0.0, 0.0
     for aid in ids:
@@ -125,6 +189,18 @@ def score(name, ids):
             return None
         z = np.load(f)
         t, n, tgt, e, q, d = z["t"], list(z["names"]), z["tgt"], z["err"], z["q_rep"], z["diag"]
+        if activity is not None:   # only the frames with this label (gaps between them are skipped by the dt filter)
+            lab = labels(aid, t)
+            sv = np.minimum(d[:, 2], d[:, 3])
+            if activity == "reach":
+                keep = sv < 0.04
+            elif activity in lab:
+                keep = lab[activity]
+            else:
+                keep = ~(lab["squat"] | lab["step"] | lab["turn"] | (sv < 0.04))
+            if keep.sum() < 2:
+                continue
+            t, tgt, e, q, d = t[keep], tgt[keep], e[keep], q[keep], d[keep]
         arm = np.array([("hand" not in x and not x.startswith("waist")) for x in n])
         dt = np.diff(t)
         ok = (dt > 0.02) & (dt < 0.15)
@@ -145,6 +221,8 @@ def score(name, ids):
         elbow = max(elbow, float(q[:, [n.index("left_elbow_joint"), n.index("right_elbow_joint")]].max()))
         tot["ms"].append(json.load(open(os.path.join(ROOT, "results", name, aid + ".json")))["ms_per_frame"])
     m = tot["min"]
+    if m <= 0:
+        return {"min": 0.0}
     e = np.concatenate(errs)
     return {"min": round(m, 1), "swing40": round(tot["swing40"] / m, 2), "swing25": round(tot["swing25"] / m, 2),
             "jerk": round(tot["jerk"] / m, 2), "err3": round(tot["err3"] / m, 2), "err5": round(tot["err5"] / m, 2),
@@ -154,6 +232,18 @@ def score(name, ids):
 
 def cmd_compare(a):
     ids = [x["id"] for x in chosen(a.split)]
+    if getattr(a, "by_activity", False):
+        keys = ["swing40", "swing25", "jerk", "err3", "err5", "err_mean"]
+        print(f"split {a.split}: {len(ids)} assets, by activity (per minute of that activity)")
+        print(f"{'activity':8s} {'variant':16s} {'min':>5s} " + " ".join(f"{k:>9s}" for k in keys))
+        for act in ("squat", "step", "turn", "reach", "other"):
+            for name in a.names:
+                sc = score(name, ids, act)
+                if sc is None or not sc.get("min"):
+                    continue
+                print(f"{act:8s} {name:16s} {sc['min']:5.1f} " + " ".join(f"{sc[k]:9}" for k in keys))
+            print()
+        return
     keys = ["swing40", "swing25", "jerk", "err3", "err5", "err_mean", "roll_range", "elbow_max", "near_limit", "ms"]
     print(f"split {a.split}: {len(ids)} assets")
     print(f"{'variant':16s} {'min':>5s} " + " ".join(f"{k:>10s}" for k in keys))
@@ -185,6 +275,7 @@ def main():
     p.add_argument("--skip-existing", action="store_true", help="keep results of assets already replayed")
     p = sub.add_parser("compare")
     p.add_argument("names", nargs="+")
+    p.add_argument("--by-activity", action="store_true")
     p.add_argument("--split", default="train", choices=["train", "test", "all"])
     a = ap.parse_args()
     {"add": cmd_add, "list": cmd_list, "run": cmd_run, "compare": cmd_compare}[a.cmd](a)
