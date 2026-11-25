@@ -74,6 +74,7 @@ def main():
     ap.add_argument("--t0", type=float, default=None, help="seconds from the first row")
     ap.add_argument("--t1", type=float, default=None)
     ap.add_argument("--posture-cost", type=float, default=float(os.environ.get("DWBC_IK_POSTURE_COST", "0.01")))
+    ap.add_argument("--smooth", default=None, help="1 / 0: dwbc_ik_global.set_smoothing (DWBC_IK_SMOOTH), before --set")
     ap.add_argument("--set", action="append", default=[])
     ap.add_argument("--json", default=None)
     ap.add_argument("--series", default=None, help="write per-frame npz (t, target, logged q, replay q)")
@@ -81,6 +82,8 @@ def main():
 
     mod = load_solver(os.path.abspath(a.ik))
     G = mod.GlobalBodyIKSolver
+    if a.smooth is not None:
+        print(mod.set_smoothing(a.smooth == "1"), file=sys.stderr)
     for kv in a.set:
         k, v = kv.split("=", 1)
         old = getattr(G, k)

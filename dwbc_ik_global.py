@@ -512,3 +512,22 @@ def _install_fast_warmup():
 
 
 _install_fast_warmup()
+
+
+# DWBC_IK_SMOOTH (2026-11-25, real-robot A/B of the ik-reach-fix smoothing): "1" = v2 (the class defaults above),
+# "0" = exactly the solver that ran on the robot before (main ee9ef62): no speed bound / damping in the QP, bare
+# VMAX 4.0 clip, absolute switch margin, SUSTAIN 3. tests/ik_replay.py --smooth 0 reproduces the logged 11-24 IK
+# output, which checks that "0" is the old behaviour.
+SMOOTH_OFF = {"IK_VMAX": 0.0, "SING_SV": 0.0, "OUT_AMAX": 0.0, "TASK_MARGIN_REL": 0.0, "SUSTAIN": 3, "VMAX": 4.0,
+              "UNLOCK_RAMP_S": 0.0}
+
+
+def set_smoothing(on):
+    """on = v2 smoothing (class defaults), off = the pre-2026-11-24 solver; returns a one-line description."""
+    if not hasattr(GlobalBodyIKSolver, "_smooth_defaults"):
+        GlobalBodyIKSolver._smooth_defaults = {k: getattr(GlobalBodyIKSolver, k) for k in SMOOTH_OFF}
+    for k, v in (GlobalBodyIKSolver._smooth_defaults if on else SMOOTH_OFF).items():
+        setattr(GlobalBodyIKSolver, k, v)
+    G = GlobalBodyIKSolver
+    return (f"smoothing {'ON (v2)' if on else 'OFF (as before 11-24)'}: IK_VMAX {G.IK_VMAX} WAIST_VMAX {G.WAIST_VMAX} "
+            f"SING_SV {G.SING_SV} OUT_AMAX {G.OUT_AMAX} VMAX {G.VMAX} SUSTAIN {G.SUSTAIN} TASK_MARGIN_REL {G.TASK_MARGIN_REL}")
