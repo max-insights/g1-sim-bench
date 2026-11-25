@@ -29,6 +29,9 @@ export DWBC_IK_SMOOTH=${DWBC_IK_SMOOTH:-1}
 # Takes effect at the next DWBC start.
 export DWBC_IK_LOCK_ROLL=${DWBC_IK_LOCK_ROLL:-1}
 export DWBC_IK_ROLL_MAX_DEG=${DWBC_IK_ROLL_MAX_DEG:-10}
+# elbow kept short of straight (straight = 1.41 rad) against the jerks at the reach limit (2026-11-25); off until it
+# passes the ik_bench test split. Try: DWBC_IK_ELBOW_MAX=1.0
+# export DWBC_IK_ELBOW_MAX=1.0
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
 # single-step mode (2026-11-23, dwbc_step_ext.py): PICO left stick click toggles it, a flick = one step;

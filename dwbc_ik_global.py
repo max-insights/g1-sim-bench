@@ -130,6 +130,10 @@ class GlobalBodyIKSolver(BodyIKSolver):
     # waist still helps through yaw / pitch, but the torso no longer leans sideways (waist roll is also the motor that
     # overheated on 11-23). False = roll free as before. dwbc_run.py: DWBC_IK_LOCK_ROLL.
     LOCK_WAIST_ROLL = False
+    # elbow kept short of fully straight (2026-11-25, real runs 11-25: the arm sat at 1.39-1.40 rad = straight at p99 and
+    # jerked 25-70 deg - elbow re-bending, upper-arm twist - while the hand moved < 5 cm). G1 elbow: straight at about
+    # 1.41 rad (reach 0.375 m), limit 2.09 (bends back past straight). 0 = model limit as before.
+    ELBOW_MAX = 0.0
     WAIST_ROLL_MAX_DEG = 0.0   # with LOCK_WAIST_ROLL: roll may still move this far from home (0 = held fixed)
     clock = staticmethod(time.monotonic)   # benchmarks replace it with a simulated clock
     verbose = False                        # dwbc_run.py: print every switch to teleop.log
@@ -144,6 +148,12 @@ class GlobalBodyIKSolver(BodyIKSolver):
         if wp is not None:
             self.lo[wp] = max(self.lo[wp], self.WAIST_PITCH_MIN)
             model.lowerPositionLimit[wp] = self.lo[wp]
+        if self.ELBOW_MAX > 0:
+            for side in ("left", "right"):
+                ie = idx.get(f"{side}_elbow_joint")
+                if ie is not None:
+                    self.hi[ie] = min(self.hi[ie], self.ELBOW_MAX)
+                    model.upperPositionLimit[ie] = self.hi[ie]
         self.fixed = np.zeros(len(self.lo), dtype=bool)   # joints the IK never moves (LOCK_WAIST_ROLL)
         wr = idx.get("waist_roll_joint")
         if self.LOCK_WAIST_ROLL and wr is not None:
