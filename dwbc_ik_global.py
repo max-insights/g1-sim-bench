@@ -48,11 +48,11 @@ class GlobalBodyIKSolver(BodyIKSolver):
     TASK_MARGIN = 1.5         # task-cost units (1 = 1 cm of wrist position error)
     POSTURE_MARGIN = 1.0      # posture-cost units, with the task cost no worse than TASK_SLACK
     TASK_SLACK = 0.3
-    SUSTAIN = 3               # frames a candidate must stay better before it takes over
+    SUSTAIN = 8               # frames a candidate must stay better before it takes over (v2: 3 -> 8, a bounded active solution catches up within ~0.4 s; 3 gave 15 switches of 60-90 deg)
     MIN_DWELL_S = 0.3         # minimum time between two switches (a switch may retarget a running blend)
     BLEND_MIN_S = 0.6
     BLEND_RAD_PER_S = 2.0
-    VMAX = 4.0                # rad/s cap on every published joint
+    VMAX = 3.0                # rad/s cap on every published joint (below the control loop's 3.5 rad/s interpolation cap)
     WAIST_PITCH_MIN = -0.087  # rad (-5 deg)
     LIMIT_EPS = 0.02          # rad: "sitting on a limit"
     POSTURE_W = 0.6           # posture cost per rad of (weighted) distance from the home posture
@@ -100,6 +100,32 @@ class GlobalBodyIKSolver(BodyIKSolver):
     HOLD_NO_PROGRESS = True   # target still + active solution off target + a frame of steps gains nothing: keep q
     HOLD_ERR = 0.3            # task-error units (cm + deg/20)
     HOLD_MIN_GAIN = 0.02
+    # output smoothing (2026-11-24, branch ik-reach-fix; offline replay tests/ik_replay.py of the 11-24 runs): the
+    # published joints follow the IK with a bounded acceleration instead of a bare VMAX clip. A one-frame IK jump
+    # (waist lock / unlock, near-singular arm, re-convergence) used to come out as a full-VMAX step that started and
+    # stopped within one frame; now it ramps up and brakes so it stops on the target without overshoot. 0 = off
+    # (bare VMAX clip, as before).
+    OUT_AMAX = 20.0           # rad/s^2 (v2 replay sweep 15-30 with IK_VMAX: 20 balances jerk vs hand offset)
+    # relative switch margin: a candidate must also beat the active solution's task cost by this fraction. With the
+    # hands far out of reach every candidate is poor and an absolute 1.5 cm margin switched on noise (run 11-24 16:15
+    # after the e-stop: 30 switches of 20-230 deg while the targets were metres away). 0 = absolute margin only.
+    TASK_MARGIN_REL = 0.2
+    # v2 (2026-11-24): keep the IK solution itself continuous, so the published joints need no catching up and the
+    # hand stays on its target while the arm moves (v1 only smoothed the output: jumps came out slower, with the hand
+    # off target for longer). 0 / None = off (as v1).
+    #  IK_VMAX       per-frame joint speed bound INSIDE the QP (pink VelocityLimit) for the per-frame steps of the
+    #                active solution, the candidates and the upright tracker: the QP picks the joint motion that keeps
+    #                the hands closest to their targets within the bound, instead of a jump that a clip cuts up later.
+    #                Re-seeds and the warm-up stay unbounded (they must converge from far away).
+    #  WAIST_VMAX    the same bound for the waist joints (rad/s)
+    #  UNLOCK_RAMP_S after the waist is freed its bound ramps from 0 to WAIST_VMAX over this time (no lurch on unlock)
+    #  SING_SV       below this smallest singular value of a hand Jacobian (arm columns; typical 0.07-0.08, 5% of
+    #                frames < 0.005-0.04) the QP gets extra damping, up to SING_DAMP at 0 (damped least squares)
+    IK_VMAX = 4.0
+    WAIST_VMAX = 0.6
+    UNLOCK_RAMP_S = 0.0         # replay: no effect once WAIST_VMAX bounds the waist (kept as an option)
+    SING_SV = 0.04
+    SING_DAMP = 0.05
     clock = staticmethod(time.monotonic)   # benchmarks replace it with a simulated clock
     verbose = False                        # dwbc_run.py: print every switch to teleop.log
 
@@ -144,6 +170,9 @@ class GlobalBodyIKSolver(BodyIKSolver):
         self.blend = None          # (t0, duration, q_from)
         self.no_switch_until = -1e9
         self.q_out = self.q_home.copy()
+        self.v_out = np.zeros(len(self.q_home))   # published joint velocity (OUT_AMAX)
+        self._now = None
+        self._t_unlock = None
         self.t_last = None
         self.rng = np.random.default_rng(0)
         self.switches = 0
@@ -181,9 +210,40 @@ class GlobalBodyIKSolver(BodyIKSolver):
         hi[self.is_waist] = lock + 1e-6
         return lo, hi
 
-    def _step(self, cfg, n, lock=None):
-        """n IK steps; lock = waist joint values to hold the waist at (None = waist free)"""
+    def _vel_bound(self):
+        """per-step velocity bound (rad/s, pink VelocityLimit) giving at most IK_VMAX / WAIST_VMAX per frame"""
+        if not self.IK_VMAX:
+            return None
+        per_step = 1.0 / max(1, self.num_step_per_frame)
+        vb = np.full(len(self.q_home), 1e3)
+        vb[self.armwaist & ~self.is_waist] = self.IK_VMAX * per_step
+        w = self.WAIST_VMAX
+        if self.UNLOCK_RAMP_S > 0 and self.waist_mode == "free" and self._t_unlock is not None and self._now is not None:
+            w *= float(np.clip((self._now - self._t_unlock) / self.UNLOCK_RAMP_S, 0.05, 1.0))
+        vb[self.is_waist] = w * per_step
+        # one frame lasts ~num_step_per_frame * dt of IK time: scale so the bound is per wall-clock frame (50 ms)
+        return vb * (0.05 / self.dt)
+
+    def _sing_damp(self, cfg):
+        if not self.SING_SV:
+            return 1e-12
+        sv = 1e9
+        cols = self.armwaist & ~self.is_waist
+        for f in self.hand_frames:
+            if self.tasks[f].transform_target_to_world is None:
+                continue
+            J = self.tasks[f].compute_jacobian(cfg)[:, cols]
+            sv = min(sv, float(np.linalg.svd(J, compute_uv=False)[-1]))
+        x = max(0.0, 1.0 - sv / self.SING_SV)
+        return 1e-12 + self.SING_DAMP * x * x
+
+    def _step(self, cfg, n, lock=None, bounded=False):
+        """n IK steps; lock = waist joint values to hold the waist at (None = waist free); bounded = per-frame step
+        (IK_VMAX / WAIST_VMAX inside the QP, singularity damping)"""
+        from pink.limits import ConfigurationLimit, VelocityLimit
+
         locked = lock is not None
+        vb = self._vel_bound() if bounded else None
         lo, hi = self._limits(lock)
         model = cfg.model
         if locked:      # the QP must know the waist is fixed, else it plans waist motion that the clip then drops
@@ -198,7 +258,14 @@ class GlobalBodyIKSolver(BodyIKSolver):
                 if self._waist_task is not None and not locked:
                     self._waist_task.set_target_from_configuration(cfg)
                     tasks.append(self._waist_task)
-                v = solve_ik(cfg, tasks, dt=self.dt, solver=self.solver)
+                if vb is not None:
+                    lim = [ConfigurationLimit(model), VelocityLimit(model, vb)]
+                    v = solve_ik(cfg, tasks, dt=self.dt, solver=self.solver, limits=lim,
+                                 damping=self._sing_damp(cfg), safety_break=False)
+                elif bounded and self.SING_SV:
+                    v = solve_ik(cfg, tasks, dt=self.dt, solver=self.solver, damping=self._sing_damp(cfg))
+                else:
+                    v = solve_ik(cfg, tasks, dt=self.dt, solver=self.solver)
                 cfg.update(np.clip(cfg.q + v * self.dt * self.amplify_factor, lo, hi))
         finally:
             if locked:
@@ -238,6 +305,8 @@ class GlobalBodyIKSolver(BodyIKSolver):
         cfg.update(np.clip(cfg.q + v * self.dt, lo, hi))
 
     def _waist_mode(self, mode, now, err, why):
+        if mode == "free" and self.waist_mode != "free":
+            self._t_unlock = now
         self.waist_mode, self.unlock_n, self.relock_n = mode, 0, 0
         self.waist_log.append((now, mode, err))
         if self.verbose:
@@ -274,6 +343,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
                 self.tasks[link_name].set_target(pin.SE3(pose[:3, :3], pose[:3, 3]))
 
         now = self.clock()
+        self._now = now
         if self._fast:
             # IK warm-up (TeleopRetargetingIK runs 50 calls back to back on the first frame after A+X / after a reset):
             # only the active solution steps - no candidates, upright tracker, mode logic or output motion. With them
@@ -294,15 +364,15 @@ class GlobalBodyIKSolver(BodyIKSolver):
         # not while the waist straightens: moving the waist reference raises the error for a moment by design
         if self.HOLD_NO_PROGRESS and still and self.waist_mode != "returning":
             q0, e0 = self.configuration.q.copy(), self._task_err(self.configuration)
-            self._step(self.configuration, self.num_step_per_frame, lock)
+            self._step(self.configuration, self.num_step_per_frame, lock, bounded=True)
             e1 = self._task_err(self.configuration)
             if e1 > self.HOLD_ERR and e0 - e1 < self.HOLD_MIN_GAIN:
                 # target still and out of reach: the step only slides the arm along the reach boundary - keep it
                 self.configuration.update(q0)
         else:
-            self._step(self.configuration, self.num_step_per_frame, lock)
+            self._step(self.configuration, self.num_step_per_frame, lock, bounded=True)
         if self.upright is not None:
-            self._step(self.upright, self.num_step_per_frame, home_w)
+            self._step(self.upright, self.num_step_per_frame, home_w, bounded=True)
             if self.waist_mode == "free" and self.frame_n % 3 == 0:
                 # the upright tracker can stall in a bad branch (e.g. hands still): every 3 frames try a fresh start -
                 # the active arms with the waist at home, the home pose or a seed - and keep it if it tracks better
@@ -327,7 +397,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
                 self._step(cfg, self.RESEED_STEPS, lock)
                 self.better[k] = 0
             else:
-                self._step(cfg, self.num_step_per_frame, lock)
+                self._step(cfg, self.num_step_per_frame, lock, bounded=True)
         if reseed:
             self.reseed_k = (self.reseed_k + 1) % self.N_CAND
 
@@ -362,7 +432,7 @@ class GlobalBodyIKSolver(BodyIKSolver):
         best, best_gain, reason = None, 0.0, ""
         for k, cfg in enumerate(self.cands):
             tc, pc = self._cost(cfg)
-            if ta - tc >= self.TASK_MARGIN:
+            if ta - tc >= max(self.TASK_MARGIN, self.TASK_MARGIN_REL * ta):
                 why, gain = "tracks better", ta - tc
             elif ta - tc >= -self.TASK_SLACK and pa - pc >= self.POSTURE_MARGIN:
                 why, gain = "same tracking, natural posture", (pa - pc) * 0.5
@@ -400,8 +470,19 @@ class GlobalBodyIKSolver(BodyIKSolver):
             q_want = q_act
         dt = 0.1 if self.t_last is None else min(0.2, max(0.02, now - self.t_last))
         self.t_last = now
-        step = self.VMAX * dt
-        self.q_out = self.q_out + np.clip(q_want - self.q_out, -step, step)
+        if self.OUT_AMAX > 0:
+            # bounded-acceleration follower: the speed that can still brake to a stop at the target
+            # (sqrt(2 A |e|), capped at VMAX), reached with at most A*dt of speed change per frame, never past the target
+            e = q_want - self.q_out
+            ae = np.abs(e)
+            v_des = np.sign(e) * np.minimum(self.VMAX, np.sqrt(2.0 * self.OUT_AMAX * ae))
+            dv = self.OUT_AMAX * dt
+            self.v_out = self.v_out + np.clip(v_des - self.v_out, -dv, dv)
+            self.v_out = np.clip(self.v_out, -ae / dt, ae / dt)
+            self.q_out = self.q_out + self.v_out * dt
+        else:
+            step = self.VMAX * dt
+            self.q_out = self.q_out + np.clip(q_want - self.q_out, -step, step)
         self.robot.cache_forward_kinematics(self.q_out)
         return self.q_out.copy()
 
@@ -431,3 +512,22 @@ def _install_fast_warmup():
 
 
 _install_fast_warmup()
+
+
+# DWBC_IK_SMOOTH (2026-11-25, real-robot A/B of the ik-reach-fix smoothing): "1" = v2 (the class defaults above),
+# "0" = exactly the solver that ran on the robot before (main ee9ef62): no speed bound / damping in the QP, bare
+# VMAX 4.0 clip, absolute switch margin, SUSTAIN 3. tests/ik_replay.py --smooth 0 reproduces the logged 11-24 IK
+# output, which checks that "0" is the old behaviour.
+SMOOTH_OFF = {"IK_VMAX": 0.0, "SING_SV": 0.0, "OUT_AMAX": 0.0, "TASK_MARGIN_REL": 0.0, "SUSTAIN": 3, "VMAX": 4.0,
+              "UNLOCK_RAMP_S": 0.0}
+
+
+def set_smoothing(on):
+    """on = v2 smoothing (class defaults), off = the pre-2026-11-24 solver; returns a one-line description."""
+    if not hasattr(GlobalBodyIKSolver, "_smooth_defaults"):
+        GlobalBodyIKSolver._smooth_defaults = {k: getattr(GlobalBodyIKSolver, k) for k in SMOOTH_OFF}
+    for k, v in (GlobalBodyIKSolver._smooth_defaults if on else SMOOTH_OFF).items():
+        setattr(GlobalBodyIKSolver, k, v)
+    G = GlobalBodyIKSolver
+    return (f"smoothing {'ON (v2)' if on else 'OFF (as before 11-24)'}: IK_VMAX {G.IK_VMAX} WAIST_VMAX {G.WAIST_VMAX} "
+            f"SING_SV {G.SING_SV} OUT_AMAX {G.OUT_AMAX} VMAX {G.VMAX} SUSTAIN {G.SUSTAIN} TASK_MARGIN_REL {G.TASK_MARGIN_REL}")

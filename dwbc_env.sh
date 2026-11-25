@@ -20,6 +20,9 @@ export DWBC_ENABLE_WAIST=${DWBC_ENABLE_WAIST:-1}
 export DWBC_IK_POSTURE_COST=${DWBC_IK_POSTURE_COST:-0.01}
 # multi-start (global) arm IK, dwbc_ik_global.py (2026-11-18); DWBC_IK_GLOBAL=0 turns it off
 export DWBC_IK_GLOBAL=${DWBC_IK_GLOBAL:-1}
+# arm IK smoothing v2 (2026-11-24: speed bound inside the IK, singularity damping; offline replay: joint jerks
+# 17 -> 2 per minute, hand offset unchanged). 0 = the IK as before. Takes effect at the next DWBC start.
+export DWBC_IK_SMOOTH=${DWBC_IK_SMOOTH:-0}
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
 # single-step mode (2026-11-23, dwbc_step_ext.py): PICO left stick click toggles it, a flick = one step;

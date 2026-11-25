@@ -8,6 +8,7 @@ DWBC_DDS_DOMAIN  Unitree DDS domain for the control loop and its MuJoCo sim (the
 DWBC_ENABLE_WAIST "1": add --enable-waist (waist in the arm IK -> torso lean to the leg policy).
 DWBC_IK_POSTURE_COST e.g. "0.1": arm IK posture task weight for the teleop loop (upstream 0.01).
 DWBC_IK_GLOBAL   "1": multi-start (global) arm IK for the teleop loop (dwbc_ik_global.py).
+DWBC_IK_SMOOTH   "1": its smoothing v2 (2026-11-24); else the solver as before.
 DWBC_ABXY_RESET  "1": A+B+X+Y returns slowly to the standing pose (dwbc_teleop_ext.py).
 DWBC_KP_SCALE    optional, e.g. "0.8": scales every MOTOR_KP (not used by default).
 DWBC_WAIST_PITCH_KD e.g. "0": waist pitch kd override (real upstream: -5), unset = upstream.
@@ -87,11 +88,15 @@ mod = MODULES[sys.argv[1]]
 if os.environ.get("DWBC_IK_GLOBAL") == "1" and sys.argv[1] == "teleop":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import decoupled_wbc.control.teleop.teleop_retargeting_ik as _TRI
+    import dwbc_ik_global as _IKG
     from dwbc_ik_global import GlobalBodyIKSolver
 
     GlobalBodyIKSolver.verbose = True
     _TRI.BodyIKSolver = GlobalBodyIKSolver
     print("[dwbc_run] arm IK: multi-start global solver (dwbc_ik_global.py)", flush=True)
+    # DWBC_IK_SMOOTH (2026-11-25): "1" = IK smoothing v2 (speed bound inside the QP, singularity damping), anything
+    # else = the solver as before 11-24 (default, until the real-robot A/B is done)
+    print("[dwbc_run] arm IK " + _IKG.set_smoothing(os.environ.get("DWBC_IK_SMOOTH") == "1"), flush=True)
 # DWBC_ABXY_RESET=1 (2026-11-18): A+B+X+Y after the first press slowly returns arms + waist to the standing pose
 # (dwbc_teleop_ext.py; the streamer part is patch_reset.py in pico_streamer.py)
 if os.environ.get("DWBC_ABXY_RESET") == "1" and sys.argv[1] == "teleop":
