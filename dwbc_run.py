@@ -10,6 +10,8 @@ DWBC_IK_POSTURE_COST e.g. "0.1": arm IK posture task weight for the teleop loop 
 DWBC_IK_GLOBAL   "1": multi-start (global) arm IK for the teleop loop (dwbc_ik_global.py).
 DWBC_ABXY_RESET  "1": A+B+X+Y returns slowly to the standing pose (dwbc_teleop_ext.py).
 DWBC_KP_SCALE    optional, e.g. "0.8": scales every MOTOR_KP (not used by default).
+DWBC_WAIST_PITCH_KD e.g. "0": waist pitch kd override (real upstream: -5), unset = upstream.
+DWBC_STEP        "1": single-step mode (dwbc_step_ext.py), off by default.
 DWBC_LATENCY     "0" turns off the per-hop latency recording (dwbc_latency.py; on by default).
 """
 import os
@@ -29,6 +31,30 @@ def _override(wbc_config, config, missed_keys_only=False):
     s = os.environ.get("DWBC_KP_SCALE")
     if s:
         out["MOTOR_KP"] = [float(k) * float(s) for k in out["MOTOR_KP"]]
+    # DWBC_WAIST_PITCH_KD (2026-11-23, unset = upstream): on the real robot upstream sets the waist pitch kd to
+    # 5 - 10 = -5 ("sim2real gap", configs.py). In MuJoCo -5 makes deep squats slide 33-35 cm and stand-ups drift /
+    # fall with 20 ms delay; 0 and +5 do not (tests/step_sim.py squat). Candidate fix for the step after standing up.
+    # Mac app (设置 → 腰部阻尼, hub dwbc_gains_set): dwbc_gains.json, REAL robot only, read once here at start.
+    # Precedence: DWBC_WAIST_PITCH_KD (environment) > dwbc_gains.json > upstream.
+    wk, src = os.environ.get("DWBC_WAIST_PITCH_KD"), "env DWBC_WAIST_PITCH_KD"
+    if wk in (None, "") and out.get("ENV_TYPE") == "real":
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import dwbc_gains
+
+            vals, errs = dwbc_gains.load()
+            for e in errs:
+                print(f"[dwbc_run] dwbc_gains.json ignored: {e}", flush=True)
+            wk, src = vals.get("waist_pitch_kd"), "dwbc_gains.json (Mac app)"
+        except Exception as e:  # noqa: BLE001 - never block the start over the override file
+            print(f"[dwbc_run] dwbc_gains.json not read: {e!r}", flush=True)
+            wk = None
+    if wk not in (None, ""):
+        out["MOTOR_KD"] = list(out["MOTOR_KD"])
+        out["MOTOR_KD"][14] = float(wk)
+    else:
+        src = "upstream"
+    print(f"[dwbc_run] waist pitch kd={out['MOTOR_KD'][14]} ({src})", flush=True)
     print(f"[dwbc_run] DOMAIN_ID={out.get('DOMAIN_ID')} INTERFACE={out.get('INTERFACE')} ENV_TYPE={out.get('ENV_TYPE')}",
           flush=True)
     return out
@@ -74,6 +100,16 @@ if os.environ.get("DWBC_ABXY_RESET") == "1" and sys.argv[1] == "teleop":
 
     dwbc_teleop_ext.install()
     print("[dwbc_run] A+B+X+Y: leg policy on + slow return to standing (dwbc_teleop_ext.py)", flush=True)
+# DWBC_STEP=1 (2026-11-23, off by default): single-step mode (dwbc_step_ext.py). PICO left stick click toggles it, a
+# flick = one step (each foot lifts once); keys t/g/f/h on the control loop. Control loop and teleop must agree.
+if os.environ.get("DWBC_STEP") == "1":
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dwbc_step_ext
+
+    if sys.argv[1] == "control":
+        dwbc_step_ext.install_control()
+    else:
+        dwbc_step_ext.install_teleop()
 _pc = os.environ.get("DWBC_IK_POSTURE_COST")
 if _pc and sys.argv[1] == "teleop":
     from decoupled_wbc.control.teleop.solver.body import body_ik_solver_settings as _BS

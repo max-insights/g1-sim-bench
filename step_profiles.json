@@ -1,0 +1,44 @@
+{
+ "fwd": {
+  "speed": 0.2,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "back": {
+  "speed": 0.3,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "left": {
+  "speed": 0.2,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "right": {
+  "speed": 0.2,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "turn_left": {
+  "speed": 0.5,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "turn_right": {
+  "speed": 0.5,
+  "stop_on": "lift",
+  "count": 2
+ },
+ "turn": {
+  "step_deg": 15.0,
+  "hold_speed": 0.5,
+  "hold_s": 0.4
+ },
+ "rise": {
+  "speed": 0.15,
+  "slow_zone": 0.1,
+  "slow_speed": 0.05
+ },
+ "updated": 1795492549.756006,
+ "by": "mac app 127.0.0.1:33152"
+}

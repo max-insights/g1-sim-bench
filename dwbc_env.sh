@@ -22,6 +22,11 @@ export DWBC_IK_POSTURE_COST=${DWBC_IK_POSTURE_COST:-0.01}
 export DWBC_IK_GLOBAL=${DWBC_IK_GLOBAL:-1}
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
+# single-step mode (2026-11-23, dwbc_step_ext.py): PICO left stick click toggles it, a flick = one step;
+# keys t/g/f/h on the control loop. 0 turns it off
+export DWBC_STEP=${DWBC_STEP:-1}
+# per-direction tuning: speed m/s, stop at the Nth lift|touchdown (defaults in dwbc_step.py PROFILES):
+# export DWBC_STEP_FWD=0.20,lift,2   DWBC_STEP_BACK=0.15,lift,2   DWBC_STEP_LEFT=0.20,lift,2   DWBC_STEP_RIGHT=0.20,lift,2
 # one math-library thread per process (2026-11-23). Unlimited, torch / numpy / OpenBLAS start a thread per core in both
 # loops and they fight (load ~40, control 10 cores, teleop 8). Sim A/B (tests/thread_ab.sh): arm IK p50 38 -> 5.5 ms,
 # p90 160 -> 8, stalls 10% -> 0, control loop missed-timing reports 75-328 -> 0. Set e.g. OMP_NUM_THREADS=24 to undo.
