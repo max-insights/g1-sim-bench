@@ -110,6 +110,7 @@ def main():
     Q = [f"q{i}" for i in range(31)]
 
     out_t, out_tgt, out_log, out_rep, out_err, out_new = [], [], [], [], [], []
+    out_ms = []   # IK time per frame (ms)
     prev_active, prev_log = False, None
     n_reset = 0
     pub_cfg = None
@@ -140,7 +141,9 @@ def main():
         ik.set_goal({"body_data": body, "left_hand_data": None, "right_hand_data": None})
         _c0 = _time.perf_counter()
         q = np.asarray(ik.get_action(), dtype=float)
-        t_cpu += _time.perf_counter() - _c0
+        _dt_ik = _time.perf_counter() - _c0
+        t_cpu += _dt_ik
+        out_ms.append(1000 * _dt_ik)
         out_new.append(not prev_active)
         out_t.append(t - tb)
         out_tgt.append(w)
@@ -192,6 +195,8 @@ def main():
                 "acc_mrad": round(1000 * float(acc), 3)}
 
     res["ms_per_frame"] = round(1000 * t_cpu / max(1, len(out_t)), 2)
+    if out_ms:
+        res["ms_p50_p90_p99_max"] = [round(float(np.percentile(out_ms, p)), 1) for p in (50, 90, 99, 100)]
     res["replay"] = smooth(qr)
     res["logged"] = smooth(ql)
     d = np.abs(qr - ql)[:, arm | waist]
@@ -214,7 +219,7 @@ def main():
         json.dump(res, open(a.json, "w"), ensure_ascii=False, indent=1)
     if a.series:
         np.savez_compressed(a.series, t=t, tgt=tgt, q_log=ql, q_rep=qr, names=np.array(names), diag=np.array(diag), err=np.array(out_err),
-                            q_act=np.array(q_act), red_names=np.array(solver.robot.joint_names))
+                            q_act=np.array(q_act), red_names=np.array(solver.robot.joint_names), ik_ms=np.array(out_ms))
 
 
 if __name__ == "__main__":

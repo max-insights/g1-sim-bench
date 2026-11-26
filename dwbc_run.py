@@ -9,6 +9,7 @@ DWBC_ENABLE_WAIST "1": add --enable-waist (waist in the arm IK -> torso lean to 
 DWBC_IK_POSTURE_COST e.g. "0.1": arm IK posture task weight for the teleop loop (upstream 0.01).
 DWBC_IK_GLOBAL   "1": multi-start (global) arm IK for the teleop loop (dwbc_ik_global.py).
 DWBC_IK_SMOOTH   "1": its smoothing v2 (2026-11-24); else the solver as before.
+DWBC_IK_WAIST_SOFT "1": arm IK waist always on (no lock / unlock switching), strong upright weight (2026-11-26).
 DWBC_IK_ELBOW_MAX e.g. "1.0": arm IK elbow upper limit in rad (straight = 1.41), unset = model limit (2026-11-25).
 DWBC_IK_LOCK_ROLL "1": the arm IK limits waist roll to +-DWBC_IK_ROLL_MAX_DEG (0 = held fixed) (2026-11-25).
 DWBC_ABXY_RESET  "1": A+B+X+Y returns slowly to the standing pose (dwbc_teleop_ext.py).
@@ -106,6 +107,15 @@ if os.environ.get("DWBC_IK_GLOBAL") == "1" and sys.argv[1] == "teleop":
     # DWBC_IK_ELBOW_MAX (2026-11-25), e.g. "1.0": elbow kept short of straight (1.41 rad) - no jerks at the reach limit
     GlobalBodyIKSolver.ELBOW_MAX = float(os.environ.get("DWBC_IK_ELBOW_MAX") or 0)
     print(f"[dwbc_run] arm IK elbow max {GlobalBodyIKSolver.ELBOW_MAX or 'model limit'}", flush=True)
+    # DWBC_IK_WAIST_SOFT (2026-11-26): "1" = no waist lock / unlock switching - the waist always takes part, held near
+    # upright by a strong posture weight (12, null-space pull x3). The lock -> free switch at the reach limit swung the
+    # arm outward 15-25 deg (dataset test/ep_000020); ik_bench test split: swings > 25 deg 10.2 -> 0.3 /min.
+    if os.environ.get("DWBC_IK_WAIST_SOFT") == "1":
+        GlobalBodyIKSolver.WAIST_PRIORITY = False
+        GlobalBodyIKSolver.WAIST_POSTURE_W = 12.0
+        GlobalBodyIKSolver.WAIST_NULL_MULT = 3.0
+    print(f"[dwbc_run] arm IK waist {'SOFT (always on, posture 12)' if not GlobalBodyIKSolver.WAIST_PRIORITY else 'lock/unlock'}",
+          flush=True)
     print("[dwbc_run] arm IK waist roll " + (("LOCKED" if GlobalBodyIKSolver.WAIST_ROLL_MAX_DEG <= 0 else
           f"LIMITED +-{GlobalBodyIKSolver.WAIST_ROLL_MAX_DEG:g} deg") if GlobalBodyIKSolver.LOCK_WAIST_ROLL else "free"),
           flush=True)

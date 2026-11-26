@@ -33,6 +33,10 @@ export DWBC_IK_ROLL_MAX_DEG=${DWBC_IK_ROLL_MAX_DEG:-10}
 # split (极限位置数据_1): arm swings > 40 deg 7.7 -> 0.6 /min, hand error > 5 cm 1.25 -> 0.15 s/min; reach -1.5 cm.
 # Unset (DWBC_IK_ELBOW_MAX=0) = model limit as before.
 export DWBC_IK_ELBOW_MAX=${DWBC_IK_ELBOW_MAX:-0.9}
+# waist always on, no lock / unlock switching (2026-11-26): the switch at the reach limit swung the arm outward
+# 15-25 deg. ik_bench test: swings > 25 deg 10.2 -> 0.3 /min, hand error > 3 cm 0.8 -> 0 s/min. Cost: in normal
+# reaching the waist makes small slow corrections (~1 deg, ~25 /min) instead of staying locked. 0 = lock / unlock.
+export DWBC_IK_WAIST_SOFT=${DWBC_IK_WAIST_SOFT:-1}
 # A+B+X+Y: leg policy on, and after the first press a slow return to standing (2026-11-18); 0 turns it off
 export DWBC_ABXY_RESET=${DWBC_ABXY_RESET:-1}
 # single-step mode (2026-11-23, dwbc_step_ext.py): PICO left stick click toggles it, a flick = one step;
