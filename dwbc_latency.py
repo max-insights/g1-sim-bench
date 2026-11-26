@@ -23,6 +23,8 @@ Recording (inside the two processes, installed by dwbc_run.py when DWBC_LATENCY 
   <run dir>/lat_teleop.csv    one row per teleop frame
   <run dir>/lat_control.csv   one row per goal the control loop picked up (the whole chain [1]-[10] in one row)
   <run dir>/lat_track.csv     one row per control cycle: commanded and measured arm joints (for [11])
+  <run dir>/lat_body.csv      one row per control cycle: pelvis IMU (quat wxyz, gyro), torso IMU, waist q measured /
+                              commanded (2026-11-26, for the walking score in dwbc_score.py)
   <run dir>/teleop_pose.csv   one row per published teleop frame: what the operator did (2026-11-24, for datasets:
                               g1_hub copies an episode's rows into ep_*/streams/dwbc_teleop.bin). Columns: POSE_DOC.
   The run dir is $DWBC_LAT_DIR, else the directory of the process's stdout log (dwbc_real.sh: real_<stamp>/).
@@ -254,7 +256,29 @@ def install_teleop():
 
 
 # ----- control process
-_cp = {"pending": None, "obs_q": None, "arms": None}
+_cp = {"pending": None, "obs_q": None, "arms": None, "obs": None, "waist": None, "body_on": True}
+BODY_COLS = (["t"] + [f"pq{i}" for i in range(4)] + [f"pg{i}" for i in range(3)] + [f"tq{i}" for i in range(4)]
+             + [f"tg{i}" for i in range(3)] + [f"wq{i}" for i in range(3)] + [f"wc{i}" for i in range(3)])
+
+
+def _body_row(self, t, q, cmd):
+    """lat_body.csv: own on/off switch, so a missing field never stops the latency files."""
+    if not _cp["body_on"]:
+        return
+    try:
+        o = _cp["obs"]
+        if _cp["waist"] is None:
+            _cp["waist"] = list(self.robot_model.get_joint_group_indices("waist"))[:3]
+            _open("lat_body.csv", BODY_COLS)
+        w = _cp["waist"]
+        fb, fv = list(o["floating_base_pose"]), list(o["floating_base_vel"])
+        tq, tg = o.get("torso_quat"), o.get("torso_ang_vel")
+        vals = (fb[3:7] + fv[3:6] + (list(tq) if tq is not None else [None] * 4)
+                + (list(tg) if tg is not None else [None] * 3) + [q[i] for i in w] + [cmd[i] for i in w])
+        _write("lat_body.csv", f"{t:.4f}," + ",".join("" if v is None else f"{float(v):.5f}" for v in vals))
+    except Exception as e:  # noqa: BLE001
+        _cp["body_on"] = False
+        print(f"[dwbc_latency] lat_body.csv disabled after an error: {e!r} (control is not affected)", flush=True)
 
 
 def install_control():
@@ -287,6 +311,7 @@ def install_control():
 
     def obs_post(self, ctx, obs):
         _cp["obs_q"] = obs.get("q") if isinstance(obs, dict) else None
+        _cp["obs"] = obs if isinstance(obs, dict) else None
 
     _wrap(GE.G1Env, "observe", None, obs_post)
 
@@ -303,6 +328,8 @@ def install_control():
             a = _cp["arms"]
             _write("lat_track.csv", f"{t:.4f}," + ",".join(f"{cmd[i]:.4f}" for i in a) + ","
                    + ",".join(f"{q[i]:.4f}" for i in a))
+            if _cp["obs"] is not None:
+                _body_row(self, t, q, cmd)
 
     _wrap(GE.G1Env, "queue_action", lambda self, action: action["q"].copy(), queue_post)
     print("[dwbc_latency] control instrumentation on", flush=True)
