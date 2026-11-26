@@ -228,7 +228,8 @@ def dim_latency(lat_mod, run, win, lat_summary):
     lat = {"score": comb(lin(e2e, "e2e_ms")), "value": e2e, "unit": "ms",
            "detail": [{"label": "最大的一段", "value": f"{lat_summary.get('worst_label') or '—'} "
                                                     f"{lat_summary.get('worst_ms') or '—'} ms"},
-                      {"label": "机器人跟随", "value": f"{lat_summary.get('follow_lag_ms') or '—'} ms"}]}
+                      ] + ([] if lat_summary.get("worst") == "follow" else
+                           [{"label": "机器人跟随", "value": f"{lat_summary.get('follow_lag_ms') or '—'} ms"}])}
     stall = {"score": comb(lin(st.get("pct"), "stall_pct")), "value": st.get("pct"), "unit": "%",
              "detail": [{"label": "最长一次多出", "value": f"{st.get('worst_extra_ms') or '—'} ms"},
                         {"label": "主要来源", "value": st.get("cause_label") or "—"}]}
