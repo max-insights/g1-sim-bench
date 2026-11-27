@@ -111,6 +111,7 @@ def main():
 
     out_t, out_tgt, out_log, out_rep, out_err, out_new = [], [], [], [], [], []
     out_ms = []   # IK time per frame (ms)
+    out_cpu = []  # IK CPU time per frame (ms, process_time)
     prev_active, prev_log = False, None
     n_reset = 0
     pub_cfg = None
@@ -139,9 +140,10 @@ def main():
         sim["t"] = t
         body = {lf: pose_mat(w[:7]), rf: pose_mat(w[7:])}
         ik.set_goal({"body_data": body, "left_hand_data": None, "right_hand_data": None})
-        _c0 = _time.perf_counter()
+        _c0, _p0 = _time.perf_counter(), _time.process_time()
         q = np.asarray(ik.get_action(), dtype=float)
         _dt_ik = _time.perf_counter() - _c0
+        out_cpu.append(1000 * (_time.process_time() - _p0))   # CPU time: not inflated by other jobs on the machine
         t_cpu += _dt_ik
         out_ms.append(1000 * _dt_ik)
         out_new.append(not prev_active)
@@ -197,6 +199,7 @@ def main():
     res["ms_per_frame"] = round(1000 * t_cpu / max(1, len(out_t)), 2)
     if out_ms:
         res["ms_p50_p90_p99_max"] = [round(float(np.percentile(out_ms, p)), 1) for p in (50, 90, 99, 100)]
+        res["cpu_ms_p50_p90_p99_max"] = [round(float(np.percentile(out_cpu, p)), 1) for p in (50, 90, 99, 100)]
     res["replay"] = smooth(qr)
     res["logged"] = smooth(ql)
     d = np.abs(qr - ql)[:, arm | waist]

@@ -148,7 +148,7 @@ def waist_activity(t, qw):
 def score_ik(name, split, asof):
     d = os.path.join(OUT, name)
     tot = dict(mins=0.0, jerk=0, sw=0, ow=0, err3=0.0, rev=0, travel=0.0)
-    errs, holds, ms = [], [], []
+    errs, holds, ms, cpu = [], [], [], []
     for x in assets(split, asof):
         f = os.path.join(d, x["id"] + ".npz")
         if not os.path.exists(f):
@@ -184,6 +184,7 @@ def score_ik(name, split, asof):
         js = json.load(open(os.path.join(d, x["id"] + ".json")))
         if js.get("ms_p50_p90_p99_max"):
             ms.append(js["ms_p50_p90_p99_max"])
+        cpu.append(js.get("cpu_ms_p50_p90_p99_max"))
         tot["mins"] += mins
     m = tot["mins"]
     if m <= 0:
@@ -193,7 +194,10 @@ def score_ik(name, split, asof):
              err_mean=float(np.nanmean(e)), waist_rev=tot["rev"] / m, waist_travel=tot["travel"] / m,
              hold=float(np.median(holds)) if holds else None,
              ik_p50=float(np.median([x[0] for x in ms])) if ms else None,
-             ik_p99=float(np.max([x[2] for x in ms])) if ms else None)
+             ik_p99=float(np.max([x[2] for x in ms])) if ms else None, ik_clock="墙钟")
+    if cpu and all(cpu):          # 2026-11-27: CPU time when every asset has it (wall time is inflated by other jobs)
+        v.update(ik_p50=float(np.median([x[0] for x in cpu])), ik_p99=float(np.max([x[2] for x in cpu])), ik_clock="CPU",
+                 ik_wall_p99=float(np.max([x[2] for x in ms])) if ms else None)
     dims = {
         "jumps": dict(score=S.comb(lin(v["jerk"], "jerk_min"), lin(v["swing25"], "swing_min"), lin(v["outward"], "outward_min")),
                       value=round(v["jerk"], 2), detail={"大摆动>25°/分钟": round(v["swing25"], 2), "往外甩>15°/分钟": round(v["outward"], 2)}),
@@ -204,7 +208,8 @@ def score_ik(name, split, asof):
                       value=round(v["waist_rev"], 1), detail={"腰行程°/分钟": round(v["waist_travel"], 1)}),
         "ik": dict(score=S.comb(lin(v["ik_p50"], "ik_p50_ms"), lin(v["ik_p99"], "ik_p99_ms")),
                    value=None if v["ik_p50"] is None else round(v["ik_p50"], 1),
-                   detail={"p99 ms": None if v["ik_p99"] is None else round(v["ik_p99"], 1)}),
+                   detail={"p99 ms": None if v["ik_p99"] is None else round(v["ik_p99"], 1), "计时": v["ik_clock"],
+                           **({"墙钟 p99 ms": round(v["ik_wall_p99"], 1)} if v.get("ik_wall_p99") else {})}),
     }
     wk = walk_dims(os.path.join(d, f"walk_{split}"), WALK_N)
     if wk:

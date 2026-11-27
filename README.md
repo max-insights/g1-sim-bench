@@ -106,6 +106,26 @@ unshare -rn bash ~/piper_ws/dwbc/dwbc_dryrun.sh       # 真机代码路径对假
   - `estop`、`kill -9` 控制循环、过热三种情况都切到了阻尼。
 - 夹爪链路单测：在私有命名空间里先启动 `dex3_emu.py --iface lo`，再跑 `dwbc_grip_test.py`。
 
+## 上线流程：改动上真机前必须过仿真门禁（2026-11-27 起）
+
+手臂逆解的任何改动（参数、`dwbc_env.sh` 里的 `DWBC_IK_*`、`dwbc_ik_global.py` 代码）上真机前，按这个顺序走：
+
+1. **仿真门禁**：和**现在真机的配置**比，用全部录下的操作员输入（`tests/ik_bench.py list`，最新的录像也算），带上半身回放走路：
+   ```bash
+   source dwbc_env.sh
+   python tests/predeploy.py NAME --env DWBC_IK_ELBOW_MAX=1.0          # 改 env 变量
+   python tests/predeploy.py NAME --set NEW_KNOB=0.5 --ik my_solver.py  # 改代码 / 新参数
+   python tests/predeploy.py NAME ... --target jumps                     # 想改善的维度（至少 +5 分）
+   ```
+   门禁 v2（`tests/sim_eval.py`）：手臂突变三项计数都不许增加；逆解 CPU 时间 p99 ≤ 50 ms（卡顿）；带上半身走路最多掉 5 分、不许摔；腰只设上限；抖动 / 手跟随最多掉 5 分。
+   **FAIL 不上真机。** 报告在 `/data/robot_data/g1/ik_bench/results/predeploy/`。
+2. **人审**：看报告（PASS 的理由、每个维度的分数），决定是否上真机。
+3. **真机 A/B**：开关先放在 `dwbc_env.sh` 的环境变量里，默认关；操作员做和问题相关的动作，录 episode。
+4. **评分卡确认**：app 监控 › 运行评分，和上一次运行对比；没变差再把默认值改成开。
+5. 每次真机运行后，把新的 episode 加进 `ik_bench`（`python tests/ik_bench.py add`），下一个改动就要过这批新数据。
+
+不在门禁里的：腿部策略、增益、网络等改动（用 `tests/sim_eval.py walk` 和真机评分卡）。大模型提的方案同样要走这个流程，没有例外。
+
 ## 还没验证的
 
 - 真机上电后的整条链路：释放模式、站立、PICO 遥操、Dex1 夹爪。2026-11-17 只做了只读预检，全部通过：lowstate 和躯干 IMU 都是 1035 Hz，mode_machine 5，两侧 Dex1 501 Hz，当时处在宇树 ai 模式。
