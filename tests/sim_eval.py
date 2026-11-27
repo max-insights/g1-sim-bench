@@ -15,6 +15,18 @@ ik   arm IK replay of the frozen teleop recordings (tests/ik_bench.py assets; re
      --asof YYYYMMDD keeps only assets recorded before that day (backtests: what was known then).
 walk single steps of the leg policy in MuJoCo (tests/walk_sim.py, 1 control tick of actuation delay = real-like).
      Dimension 走路流畅度 walking (pelvis roll / roll rate / pitch per step, extra steps, same anchors as real) + falls.
+walkik NAME [--split ...]   (2026-11-27; also `ik ... --walk`) walking WITH the candidate's upper body: the 6 most
+     active 10 s windows of the split's operator input (picked from the hand targets only, so every candidate gets the
+     same windows) are played as the candidate's IK output (arms -> arm PD, waist -> torso rpy command, as on the
+     robot) while the robot takes 3 single steps each (back / left / right / fwd / turn_left / back). Adds the
+     走路流畅度 walking dimension to the IK scorecard: does this IK change make walking worse?
+
+gate v2 (2026-11-27, operator's rule "腰可以多动，但手臂不能有突变，卡顿和走路不能变差"):
+     手臂突变 none of jerk / swing>25 / outward>15 per minute may rise above the baseline (+0.2/min tolerance);
+     卡顿 IK p99 <= 50 ms (the only stall an IK change can cause in replay; timing is load-noisy, no +-5 rule);
+     走路 walking (with the upper body) no worse than -5 and no fall;
+     腰活动 only a ceiling: reversals <= 40/min and travel <= 300 deg/min (or baseline +10 % if the baseline is higher);
+     jitter / track no worse than -5; every --target dimension at least +5.
 
 Results: $IK_BENCH/results/simeval/<NAME>/ (ik: per-asset json / npz + score_<split>.json; walk: walk.json + score.json).
 Everything runs at nice 19 and refuses to start while the real chain runs (pass --force to override).
@@ -43,8 +55,16 @@ SIM_ANCHORS = {               # sim-only dimensions (value at 100, value at 0)
 }
 DIMS = [("jumps", "突变"), ("jitter", "抖动"), ("track", "手跟随"), ("waist", "腰活动"), ("ik", "逆解"),
         ("walking", "走路流畅度")]
-GATE_DROP = 5        # a non-target dimension may lose at most this many points
+GATE_VERSION = "v2 (2026-11-27)"
+GATE_DROP = 5        # jitter / track / walking may lose at most this many points
 GATE_GAIN = 5        # each target dimension must gain at least this many points
+JUMP_TOL = 0.2       # per minute: raw jump counts may not rise above the baseline by more than this
+WAIST_REV_MAX, WAIST_TRAVEL_MAX, WAIST_OVER_BASE = 40.0, 300.0, 1.10
+IK_P99_MAX = 50.0
+# Benchmark-only splits (never visible to an agent: simtool cannot name them). They ignore --asof.
+EXTRA_SPLITS = {"hidden1126": ["20261126_155553_ep_000020"]}   # 11-26: the outward swing the real robot showed next day
+WALK_WIN, WALK_N = 10.0, 6
+WALK_DIRS = ["back", "left", "right", "fwd", "turn_left", "back"]
 
 
 def lin(v, key):
@@ -62,6 +82,8 @@ def real_chain_running():
 
 # ------------------------------------------------------------------------------------------------ ik
 def assets(split, asof):
+    if split in EXTRA_SPLITS:
+        return [x for x in B.chosen("all") if x["id"] in EXTRA_SPLITS[split]]
     out = []
     for x in B.chosen(split):
         day = x["id"][:8]
@@ -100,7 +122,7 @@ def run_ik(a):
     bad = [p for p in procs if p.wait() != 0]
     if bad:
         sys.exit(f"{len(bad)} replay(s) failed: see {d}/*.err")
-    sc = score_ik(a.name, a.split, a.asof)
+    sc = run_walkik(a) if a.walk else score_ik(a.name, a.split, a.asof)
     print(json.dumps(sc, ensure_ascii=False, indent=1))
 
 
@@ -184,7 +206,10 @@ def score_ik(name, split, asof):
                    value=None if v["ik_p50"] is None else round(v["ik_p50"], 1),
                    detail={"p99 ms": None if v["ik_p99"] is None else round(v["ik_p99"], 1)}),
     }
-    out = {"name": name, "kind": "ik", "split": split, "asof": asof, "minutes": round(m, 1),
+    wk = walk_dims(os.path.join(d, f"walk_{split}"), WALK_N)
+    if wk:
+        dims["walking"] = wk[0]
+    out = {"name": name, "kind": "ik", "split": split, "asof": asof, "minutes": round(m, 1), "falls": wk[1] if wk else 0,
            "config": json.load(open(os.path.join(d, "config.json"))), "dims": dims}
     json.dump(out, open(os.path.join(d, f"score_{split}.json"), "w"), ensure_ascii=False, indent=1)
     return out
@@ -210,12 +235,88 @@ def run_walk(a):
     print(json.dumps(score_walk(a.name), ensure_ascii=False, indent=1))
 
 
+def walk_runs(d, prefix):
+    runs = []
+    for f in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if f.startswith(prefix) and f.endswith(".json"):
+            runs += json.load(open(os.path.join(d, f)))
+    return runs
+
+
+def walk_dims(d, n_need):
+    """(walking dimension, falls) from walk_sim json files w_*.json in d, None until all n_need windows exist."""
+    runs = walk_runs(d, "w_")
+    if len(runs) < n_need:
+        return None
+    st = [s for r in runs for s in r["steps"]]
+    falls = sum(r["fell"] for r in runs)
+    if not st:
+        return None
+    med = {k: float(np.median([s[k] for s in st])) for k in ("roll", "roll_rate", "pitch", "pitch_rate")}
+    extra = 100.0 * float(np.mean([s["extra"] > 0 for s in st]))
+    return dict(score=None if falls else S.comb(lin(med["roll"], "roll_pp_deg"), lin(med["roll_rate"], "roll_rate_dps"),
+                                                lin(med["pitch"], "pitch_pp_deg"), lin(extra, "extra_pct")),
+                value=round(med["roll"], 2),
+                detail={"侧晃角速度°/s": round(med["roll_rate"], 1), "前后晃°": round(med["pitch"], 2),
+                        "多迈一步%": round(extra, 1), "摔倒": falls, "步数": len(st)}), falls
+
+
+def walk_windows(name, split, asof):
+    """the WALK_N most active WALK_WIN s windows of the split, from the operator's hand targets only."""
+    d = os.path.join(OUT, name)
+    cand = []
+    for x in assets(split, asof):
+        z = np.load(os.path.join(d, x["id"] + ".npz"))
+        t, tg = z["t"], np.nan_to_num(z["tgt"])
+        mv = np.r_[0.0, np.linalg.norm(np.diff(tg[:, 0:3], axis=0), axis=1) + np.linalg.norm(np.diff(tg[:, 7:10], axis=0), axis=1)]
+        gap = np.r_[False, np.diff(t) > 0.5]
+        mv[gap] = 0.0
+        cs = np.cumsum(mv)
+        for i in range(0, len(t), 20):
+            j = int(np.searchsorted(t, t[i] + WALK_WIN))
+            if j >= len(t):
+                break
+            if not gap[i + 1:j + 1].any():
+                cand.append((float(cs[j] - cs[i]), x["id"], float(t[i])))
+    cand.sort(key=lambda c: -c[0])
+    pick = []
+    for c in cand:
+        if all(c[1] != p[1] or abs(c[2] - p[2]) >= WALK_WIN for p in pick):
+            pick.append(c)
+        if len(pick) == WALK_N:
+            break
+    return sorted(pick, key=lambda p: (p[1], p[2]))
+
+
+def run_walkik(a):
+    d = os.path.join(OUT, a.name)
+    sc = load(a.name, a.split)
+    asof = a.asof or (sc or {}).get("asof")
+    wd = os.path.join(d, f"walk_{a.split}")
+    os.makedirs(wd, exist_ok=True)
+    env = dict(os.environ, STEP_SIM_DELAY=os.environ.get("STEP_SIM_DELAY", "1"))
+    procs = []
+    for i, (_, aid, t0) in enumerate(walk_windows(a.name, a.split, asof)):
+        js = os.path.join(wd, f"w_{i}.json")
+        if os.path.exists(js):
+            continue
+        z = np.load(os.path.join(d, aid + ".npz"))
+        m = (z["t"] >= t0) & (z["t"] <= t0 + WALK_WIN + 0.1)
+        up = os.path.join(wd, f"up_{i}.npz")
+        np.savez(up, names=z["names"], t=z["t"][m], q=z["q_rep"][m])
+        c = ["nice", "-n", "19", sys.executable, os.path.join(HERE, "walk_sim.py"), "custom", "--dirs", WALK_DIRS[i % len(WALK_DIRS)],
+             "--waits", "0", "--upper", up, "--json", js]
+        while len([p for p in procs if p.poll() is None]) >= a.j:
+            next(p for p in procs if p.poll() is None).wait()
+        procs.append(subprocess.Popen(c, env=env, stdout=open(os.path.join(wd, f"w_{i}.txt"), "w"), stderr=subprocess.STDOUT))
+    if any(p.wait() != 0 for p in procs):
+        sys.exit(f"walk sim failed: see {wd}/w_*.txt")
+    return score_ik(a.name, a.split, asof)
+
+
 def score_walk(name):
     d = os.path.join(OUT, name)
-    runs = []
-    for f in sorted(os.listdir(d)):
-        if f.startswith("walk_") and f.endswith(".json"):
-            runs += json.load(open(os.path.join(d, f)))
+    runs = walk_runs(d, "walk_")
     st = [s for r in runs for s in r["steps"]]
     if not st:
         return None
@@ -309,31 +410,66 @@ def load(name, split):
 
 
 def gate(base, cand, targets):
-    """(passed, reasons): every target dimension +GATE_GAIN, no dimension -GATE_DROP, hard limits."""
-    why, ok = [], True
-    for k, (b, c) in ((k, (base["dims"].get(k), cand["dims"].get(k))) for k in base["dims"]):
-        if b is None or c is None or b.get("score") is None or c.get("score") is None:
-            continue
-        if k == "ik":           # ms per frame depends on the shared workstation load: hard limit below, no +-5 rule
-            why.append(f"ik {b['score']} → {c['score']}（只检查 p99 ≤ 50 ms）")
-            continue
-        dlt = c["score"] - b["score"]
-        if k in targets and dlt < GATE_GAIN:
-            ok = False
-            why.append(f"目标维度 {k} 只变化 {dlt:+d} 分（要求 ≥ +{GATE_GAIN}）")
-        elif k not in targets and dlt < -GATE_DROP:
-            ok = False
-            why.append(f"{k} 变差 {dlt:+d} 分（允许 ≥ -{GATE_DROP}）")
+    """(passed, reasons), gate v2: see the module doc."""
+    why, ok = [f"门禁 {GATE_VERSION}"], True
+    bd, cd = base["dims"], cand["dims"]
+
+    def sc(dims, k):
+        return (dims.get(k) or {}).get("score")
+
+    def bad(msg):
+        nonlocal ok
+        ok = False
+        why.append("✗ " + msg)
+    for k in targets:
+        b, c = sc(bd, k), sc(cd, k)
+        if b is None or c is None or c - b < GATE_GAIN:
+            bad(f"目标 {k} {b} → {c}（要求 ≥ +{GATE_GAIN}）")
         else:
-            why.append(f"{k} {b['score']} → {c['score']} ({dlt:+d})")
-    ik = cand["dims"].get("ik") or {}
-    p99 = (ik.get("detail") or {}).get("p99 ms")
-    if p99 is not None and p99 > 50:
-        ok = False
-        why.append(f"逆解 p99 {p99} ms 超过 50 ms 预算")
+            why.append(f"目标 {k} {b} → {c} ({c - b:+d})")
+    bj, cj = bd.get("jumps"), cd.get("jumps")
+    if bj and cj:
+        for lab, bv, cv in (("关节突变/分钟", bj["value"], cj["value"]),
+                            ("大摆动>25°/分钟", bj["detail"]["大摆动>25°/分钟"], cj["detail"]["大摆动>25°/分钟"]),
+                            ("往外甩>15°/分钟", bj["detail"]["往外甩>15°/分钟"], cj["detail"]["往外甩>15°/分钟"])):
+            if cv > bv + JUMP_TOL:
+                bad(f"手臂突变 {lab} {bv} → {cv}（不允许增加）")
+            else:
+                why.append(f"手臂突变 {lab} {bv} → {cv}")
+    p99 = ((cd.get("ik") or {}).get("detail") or {}).get("p99 ms")
+    if p99 is not None and p99 > IK_P99_MAX:
+        bad(f"卡顿：逆解 p99 {p99} ms 超过 {IK_P99_MAX:.0f} ms 预算")
+    elif p99 is not None:
+        why.append(f"卡顿：逆解 p99 {p99} ms ≤ {IK_P99_MAX:.0f}")
     if cand.get("falls"):
-        ok = False
-        why.append(f"仿真摔倒 {cand['falls']} 次")
+        bad(f"仿真摔倒 {cand['falls']} 次")
+    if sc(bd, "walking") is not None or "walking" in cd:
+        b, c = sc(bd, "walking"), sc(cd, "walking")
+        if c is None:
+            bad("走路：没有带上半身回放的走路分（eval 时没跑 walk）" if "walking" not in cd else "走路：摔倒")
+        elif b is not None and c - b < -GATE_DROP:
+            bad(f"走路 {b} → {c}（允许 ≥ -{GATE_DROP}）")
+        else:
+            why.append(f"走路 {b} → {c}")
+    bw, cw = bd.get("waist"), cd.get("waist")
+    if bw and cw:
+        lr = max(WAIST_REV_MAX, WAIST_OVER_BASE * bw["value"])
+        lt = max(WAIST_TRAVEL_MAX, WAIST_OVER_BASE * bw["detail"]["腰行程°/分钟"])
+        rv, tv = cw["value"], cw["detail"]["腰行程°/分钟"]
+        if rv > lr or tv > lt:
+            bad(f"腰活动超上限：反转 {rv}/分钟（≤ {lr:.0f}），行程 {tv}°/分钟（≤ {lt:.0f}）")
+        else:
+            why.append(f"腰活动 反转 {rv}/分钟 ≤ {lr:.0f}，行程 {tv}°/分钟 ≤ {lt:.0f}（只设上限）")
+    for k in ("jitter", "track"):
+        if k in targets:
+            continue
+        b, c = sc(bd, k), sc(cd, k)
+        if b is None or c is None:
+            continue
+        if c - b < -GATE_DROP:
+            bad(f"{k} {b} → {c}（允许 ≥ -{GATE_DROP}）")
+        else:
+            why.append(f"{k} {b} → {c} ({c - b:+d})")
     return ok, why
 
 
@@ -342,18 +478,25 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("ik")
     p.add_argument("name")
-    p.add_argument("--split", default="train", choices=["train", "test", "all"])
+    p.add_argument("--split", default="train", help="train | test | all | hidden1126")
     p.add_argument("--asof", default=None)
     p.add_argument("--smooth", default="1")
     p.add_argument("--set", action="append", default=[])
     p.add_argument("--ik", default=None, help="candidate dwbc_ik_global.py (default: the repo's)")
     p.add_argument("-j", type=int, default=4)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--walk", action="store_true", help="also walking with this upper body (walkik)")
     p = sub.add_parser("walk")
     p.add_argument("name")
     p.add_argument("--params", default="{}")
     p.add_argument("--dirs", default="back,left,right,fwd,turn_left")
     p.add_argument("-j", type=int, default=5)
+    p.add_argument("--force", action="store_true")
+    p = sub.add_parser("walkik")
+    p.add_argument("name")
+    p.add_argument("--split", default="train")
+    p.add_argument("--asof", default=None)
+    p.add_argument("-j", type=int, default=6)
     p.add_argument("--force", action="store_true")
     p = sub.add_parser("show")
     p.add_argument("name")
@@ -370,10 +513,13 @@ def main():
     p.add_argument("--split", default="train")
     p.add_argument("--target", default="")
     a = ap.parse_args()
-    if a.cmd in ("ik", "walk"):
+    if a.cmd in ("ik", "walk", "walkik"):
         if not a.force and real_chain_running():
             sys.exit("真机链路正在运行：仿真暂停（--force 可强制）")
-        (run_ik if a.cmd == "ik" else run_walk)(a)
+        if a.cmd == "walkik":
+            print(json.dumps(run_walkik(a), ensure_ascii=False, indent=1))
+        else:
+            (run_ik if a.cmd == "ik" else run_walk)(a)
     elif a.cmd == "events":
         events(a)
     elif a.cmd == "show":

@@ -1,7 +1,11 @@
 """Sim study: upper-body sway during single steps (DWBC leg policy, MuJoCo). Candidates are overrides, no defaults
 changed. Usage: source dwbc_env.sh; STEP_SIM_DELAY=1 nice -n 19 python walk_sim.py CAND [CAND...] [--json out]
 CAND "custom" takes its overrides from --params JSON (keys as in CANDS: speed_scale, ramp, hyst, lpf, waist_kd [yaw, roll,
-pitch], waist_kp, height, rpy). Used by tests/sim_eval.py walk. 1 tick of delay matched the real pelvis roll (2026-11-26)."""
+pitch], waist_kp, height, rpy). Used by tests/sim_eval.py walk. 1 tick of delay matched the real pelvis roll (2026-11-26).
+--upper NPZ (2026-11-27): during the steps the upper body follows a recorded IK output (names, t, q = an arm-IK replay
+window): arm targets go to the arm PD, the waist becomes the torso rpy command of the leg policy exactly as upstream
+(g1_decoupled_whole_body_policy: torso_link relative to the yaw-only pelvis), arms given to the policy = targets.
+The arms first blend in from the default pose over 1.5 s while standing. Used by tests/sim_eval.py walkik."""
 import argparse, json, os, sys
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +45,36 @@ def euler(q):
     return r, p
 
 
-def run(cand, direction, wait, repeats=3, gap=2.2):
+UP_RAMP = 1.5
+
+
+def upper_player(sim, path):
+    """q_full(t_play, alpha) for the arm-IK output in NPZ, and the upstream torso rpy for it."""
+    from pinocchio import rpy as pin_rpy
+    z = np.load(path)
+    names = sim.rm.joint_names
+    un = [str(v) for v in z["names"]]
+    cols = [(names.index(n), i) for i, n in enumerate(un) if n in names]
+    t, q = z["t"] - z["t"][0], z["q"]
+    q0 = np.zeros(len(names))
+    q0[sim.arms] = sim.q_tgt[sim.arms]
+
+    def at(tp, alpha):
+        qf = q0.copy()
+        for j, i in cols:
+            qf[j] = q0[j] + alpha * (np.interp(tp, t, q[:, i]) - q0[j])
+        return qf
+
+    def rpy(qf):
+        sim.rm.cache_forward_kinematics(qf, auto_clip=False)
+        tor = sim.rm.frame_placement("torso_link").rotation
+        pel = sim.rm.frame_placement("pelvis").rotation
+        yaw = np.arctan2(pel[1, 0], pel[0, 0])
+        return np.asarray(pin_rpy.matrixToRpy(pin_rpy.rpyToMatrix(0, 0, yaw).T @ tor), float)
+    return at, rpy
+
+
+def run(cand, direction, wait, repeats=3, gap=2.2, upper=None):
     c = CANDS[cand]
     sim = S.Sim()
     rm = sim.rm
@@ -56,6 +89,8 @@ def run(cand, direction, wait, repeats=3, gap=2.2):
     if "height" in c:
         sim.height = c["height"]
     S.stand(sim, 2.5 + wait)
+    up = upper_player(sim, upper) if upper else None
+    t_up = sim.t + UP_RAMP
     prof = dict(PROF)
     if "speed_scale" in c:
         prof = {k: ((v[0] * c["speed_scale"],) + tuple(v[1:]) if isinstance(v, tuple) else v) for k, v in prof.items()}
@@ -68,7 +103,7 @@ def run(cand, direction, wait, repeats=3, gap=2.2):
     last_nz = -1e9
     filt = None
     rows = []
-    req = [sim.t + 0.05 + k * gap for k in range(repeats)]
+    req = [sim.t + 0.05 + (UP_RAMP if up else 0.0) + k * gap for k in range(repeats)]
     t_end = req[-1] + 3.5
     o = sim.obs()
     base0 = sim.d.qpos[0:3].copy()
@@ -98,7 +133,12 @@ def run(cand, direction, wait, repeats=3, gap=2.2):
         # tick with optional torso rpy cmd and leg-target filter
         ob = sim.obs()
         sim.pol.set_observation(ob)
-        act = sim.pol.get_action(sim.t, ob["q"][sim.arms], np.array([sim.height]), rpy, sim.nav.copy())
+        if up:
+            qf = up[0](max(0.0, sim.t - t_up), min(1.0, 1.0 - (t_up - sim.t) / UP_RAMP))
+            sim.q_tgt[sim.arms] = qf[sim.arms]
+            act = sim.pol.get_action(sim.t, qf[sim.arms], np.array([sim.height]), rpy + up[1](qf), sim.nav.copy())
+        else:
+            act = sim.pol.get_action(sim.t, ob["q"][sim.arms], np.array([sim.height]), rpy, sim.nav.copy())
         a = np.asarray(act["body_action"][0][: len(sim.lower)], float).copy()
         if "lpf" in c:
             filt = a if filt is None else c["lpf"] * a + (1 - c["lpf"]) * filt
@@ -147,13 +187,14 @@ if __name__ == "__main__":
     ap.add_argument("--waits", default="0,0.17,0.33")
     ap.add_argument("--json")
     ap.add_argument("--params", default="{}")
+    ap.add_argument("--upper", default=None, help="arm-IK output window (npz: names, t, q) to play during the steps")
     a = ap.parse_args()
     CANDS["custom"] = json.loads(a.params)
     out = []
     for cand in a.cands:
         for d in a.dirs.split(","):
             for w in [float(x) for x in a.waits.split(",")]:
-                r = run(cand, d, w)
+                r = run(cand, d, w, upper=a.upper)
                 out.append(r)
             st = [s for r in out if r["cand"] == cand and r["dir"] == d for s in r["steps"]]
             rr = [r for r in out if r["cand"] == cand and r["dir"] == d]
