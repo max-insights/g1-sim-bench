@@ -139,7 +139,13 @@ def main():
     for kv in a.set:
         k, v = kv.split("=", 1)
         old = getattr(G, k)
-        setattr(G, k, type(old)(v) if not isinstance(old, bool) else v in ("1", "True", "true"))
+        if old is None:          # v2: a knob whose default is None (off) takes the literal's own type
+            low = v.lower()
+            nv = None if low == "none" else (low in ("1", "true") if low in ("true", "false") else
+                                            (int(v) if v.lstrip("+-").isdigit() else float(v)))
+        else:
+            nv = type(old)(v) if not isinstance(old, bool) else v in ("1", "True", "true")
+        setattr(G, k, nv)
     G.verbose = False
     sim = {"t": 0.0}
     G.clock = staticmethod(lambda: sim["t"])
