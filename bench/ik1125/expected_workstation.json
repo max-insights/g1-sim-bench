@@ -1,0 +1,48 @@
+{
+ "base": {
+  "train": {
+   "jumps": 0,
+   "jitter": 27,
+   "track": 71,
+   "waist": 79,
+   "walking": 58
+  },
+  "test": {
+   "jumps": 0,
+   "jitter": 0,
+   "track": 5,
+   "waist": 0,
+   "walking": 54
+  },
+  "hidden1126": {
+   "jumps": 0,
+   "jitter": 30,
+   "track": 0,
+   "waist": 0,
+   "walking": 55
+  }
+ },
+ "human": {
+  "train": {
+   "jumps": 76,
+   "jitter": 40,
+   "track": 96,
+   "waist": 17,
+   "walking": 60
+  },
+  "test": {
+   "jumps": 85,
+   "jitter": 30,
+   "track": 100,
+   "waist": 0,
+   "walking": 55
+  },
+  "hidden1126": {
+   "jumps": 84,
+   "jitter": 50,
+   "track": 66,
+   "waist": 0,
+   "walking": 57
+  }
+ }
+}
