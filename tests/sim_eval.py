@@ -114,6 +114,8 @@ def run_ik(a):
             c += ["--smooth", a.smooth]
         if a.ik:
             c += ["--ik", a.ik]
+        if getattr(a, "trace", False):           # v2: the solver's full per-frame state next to the npz
+            c += ["--trace", os.path.join(d, x["id"] + ".trace.csv.gz")]
         for s in a.set:
             c += ["--set", s]
         while len([p for p in procs if p.poll() is None]) >= a.j:
@@ -491,6 +493,7 @@ def main():
     p.add_argument("-j", type=int, default=4)
     p.add_argument("--force", action="store_true")
     p.add_argument("--walk", action="store_true", help="also walking with this upper body (walkik)")
+    p.add_argument("--trace", action="store_true", help="also write <asset>.trace.csv.gz: the solver's full per-frame state")
     p = sub.add_parser("walk")
     p.add_argument("name")
     p.add_argument("--params", default="{}")

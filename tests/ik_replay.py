@@ -67,6 +67,56 @@ def pose_mat(v):
     return T
 
 
+def snapshot(obj, names, out=None, prefix=""):
+    """Every per-frame state of the solver, generically (read only): scalars, strings, None, numeric arrays up to 64
+    entries (31-vectors by joint name), list lengths and numeric list items, pink Configurations (.q by joint name)."""
+    out = {} if out is None else out
+    for k, v in vars(obj).items():
+        key = prefix + k
+        if v is None:
+            out[key] = ""
+        elif isinstance(v, (bool, np.bool_)):
+            out[key] = int(v)
+        elif isinstance(v, (int, float, np.integer, np.floating)):
+            out[key] = float(v)
+        elif isinstance(v, str):
+            out[key] = v[:40]
+        elif isinstance(v, np.ndarray) and v.ndim == 1 and v.size <= 64 and v.dtype.kind in "fiub":
+            lab = names if v.size == len(names) else [str(i) for i in range(v.size)]
+            for i, x in enumerate(v):
+                out[f"{key}.{lab[i]}"] = float(x)
+        elif hasattr(v, "q") and isinstance(getattr(v, "q", None), np.ndarray) and v.q.size == len(names):
+            for i, x in enumerate(v.q):
+                out[f"{key}.q.{names[i]}"] = float(x)
+        elif isinstance(v, (list, tuple)):
+            out[f"{key}#len"] = len(v)
+            for i, x in enumerate(v[:8]):
+                if isinstance(x, (bool, int, float, np.integer, np.floating)):
+                    out[f"{key}[{i}]"] = float(x)
+                elif hasattr(x, "q") and isinstance(getattr(x, "q", None), np.ndarray) and x.q.size == len(names):
+                    for j, y in enumerate(x.q):
+                        out[f"{key}[{i}].q.{names[j]}"] = float(y)
+    return out
+
+
+def write_trace(path, t, rows):
+    import gzip
+    keys = []
+    seen = set()
+    for r in rows:
+        for k in r:
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    keep = [k for k in keys if len({r.get(k, "") for r in rows}) > 1]          # drop constant columns
+    with gzip.open(path, "wt", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t"] + keep)
+        for ti, r in zip(t, rows):
+            w.writerow([f"{ti:.4f}"] + [r.get(k, "") for k in keep])
+    return len(keep), len(keys)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
@@ -78,6 +128,8 @@ def main():
     ap.add_argument("--set", action="append", default=[])
     ap.add_argument("--json", default=None)
     ap.add_argument("--series", default=None, help="write per-frame npz (t, target, logged q, replay q)")
+    ap.add_argument("--trace", default=None, help="write the solver's full per-frame state (.csv.gz): every scalar / string / "
+                    "short array attribute, list lengths, the joint vector of every pink Configuration; constant columns dropped")
     a = ap.parse_args()
 
     mod = load_solver(os.path.abspath(a.ik))
@@ -102,6 +154,7 @@ def main():
     lf = full.supplemental_info.hand_frame_names["left"]
     rf = full.supplemental_info.hand_frame_names["right"]
     solver = ik.body_ik_solver
+    rnames = [n.replace("_joint", "") for n in solver.robot.joint_names]
 
     rows = list(csv.DictReader(open(os.path.join(a.run, "teleop_pose.csv"))))
     t_all = np.array([int(r["t_mono_ns"]) for r in rows]) / 1e9
@@ -116,6 +169,7 @@ def main():
     n_reset = 0
     pub_cfg = None
     diag, q_act = [], []
+    trace = []
     import time as _time
     t_cpu = 0.0
     for r in rows:
@@ -168,6 +222,8 @@ def main():
                          float(solver.blend is not None), sv[0], sv[1], solver.switches,
                          float(np.abs(cfg.q - solver.q_out).max())])
             q_act.append(np.asarray(cfg.q, dtype=float).copy())
+        if a.trace:
+            trace.append(snapshot(solver, rnames))
 
     t = np.array(out_t)
     tgt = np.array(out_tgt)
@@ -220,6 +276,8 @@ def main():
     print(json.dumps(res, ensure_ascii=False))
     if a.json:
         json.dump(res, open(a.json, "w"), ensure_ascii=False, indent=1)
+    if a.trace:
+        res["trace_cols"] = write_trace(a.trace, out_t, trace)
     if a.series:
         np.savez_compressed(a.series, t=t, tgt=tgt, q_log=ql, q_rep=qr, names=np.array(names), diag=np.array(diag), err=np.array(out_err),
                             q_act=np.array(q_act), red_names=np.array(solver.robot.joint_names), ik_ms=np.array(out_ms))
